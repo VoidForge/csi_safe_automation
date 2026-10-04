@@ -6,17 +6,25 @@ running with the model loaded. Intended order of calls:
 
     write_coords(coords)  ->  run_analysis()  ->  write_reactions()  ->  get_utilization()
 
+get_utilization() hands the results back; write_test_record() appends them to the
+records CSV; print_vba_log() prints the workbook's own log.
+
 The workbook name is a module constant; the worksheet, cells and macro names are
 hardcoded at the top of each function.
 """
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
 from typing import Any
 
 import xlwings as xw
 
 WORKBOOK = "Auto Piling v20260916-0421.xlsm"    # must already be open in Excel
+
+RECORDS_CSV = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"
+                                # appended to by write_test_record(), one row per record
 
 _wb: xw.Book | None = None      # workbook found on the first call, kept for the session
 _n_coords = 0                   # rows written by the last write_coords() call
@@ -91,6 +99,19 @@ def _grid(values: Any, n_rows: int, n_cols: int) -> list[list[Any]]:
     return [list(row) for row in values]
 
 
+def _cell(rng: xw.Range, r: int, c: int) -> str:
+    """Address of the cell r rows down and c columns right of rng's top-left."""
+    return xw.utils.col_name(rng.column + c) + str(rng.row + r)
+
+
+def _utilization(sheet: xw.Sheet, n_rows: int) -> list[list[float]]:
+    """Read n_rows of 'Pile Coords' H:J as (util_nw, util_w, tension) triples."""
+    rng = sheet.range("H3").resize(n_rows, 3)         # H util w/o wind, I util w/ wind,
+    grid = _grid(rng.value, n_rows, 3)                # J tension surplus (kN)
+    return [[_number(grid[r][c], _cell(rng, r, c)) for c in range(3)]
+            for r in range(n_rows)]
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
@@ -132,10 +153,8 @@ def write_reactions() -> None:
 
 
 def get_utilization() -> list[list[float]]:
-    """Read the utilization pair of every pile just written, top to bottom."""
+    """Read every pile's (util_nw, util_w, tension) triple, top to bottom."""
     SHEET = "Pile Coords"
-    FIRST_CELL = "H3"                                # first utilization pair
-    N_COLS = 2
 
     if _n_coords <= 0:
         raise RuntimeError(
@@ -143,12 +162,133 @@ def get_utilization() -> list[list[float]]:
             "unknown - call write_coords() first"
         )
 
-    rng = _book(WORKBOOK).sheets[SHEET].range(FIRST_CELL).resize(_n_coords, N_COLS)
-    grid = _grid(rng.value, _n_coords, N_COLS)
+    return _utilization(_book(WORKBOOK).sheets[SHEET], _n_coords)
 
-    out = []
-    for r in range(_n_coords):
-        cell_row = rng.row + r
-        out.append([_number(grid[r][c], xw.utils.col_name(rng.column + c) + str(cell_row))
-                    for c in range(N_COLS)])
+
+def write_test_record() -> list[float]:
+    """Append the workbook's current pile values as a new row in the records CSV.
+
+    Reads 'Pile Coords' (A = pile prefix, B:C = x and y, H:J = utilization w/o
+    wind, utilization w/ wind and tension surplus) and appends the values to the
+    BOTTOM of data/SWTKT_test_records.csv - five per pile, in the CSV's own column
+    order, which the header is checked against first. Returns the row appended.
+    """
+    SHEET = "Pile Coords"
+    FIRST_ROW = 3                                    # sheet row of the first pile
+    XY = "B"                                         # x in B, y in C (A = prefix)
+    PER_PILE = 5                                     # x, y, util_nw, util_w, tension
+
+    sheet = _book(WORKBOOK).sheets[SHEET]
+
+    raw = sheet.range(f"A{FIRST_ROW}").expand("down").value
+    raw = raw if isinstance(raw, list) else [raw]     # one pile comes back as a scalar
+    prefixes = ["" if p is None else str(p).strip() for p in raw]
+    if not prefixes or not all(prefixes):
+        raise RuntimeError(
+            f"no pile prefixes found in '{SHEET}'!A{FIRST_ROW} downwards - the "
+            "coordinate table is expected in A (prefix), B (x), C (y)"
+        )
+
+    last = FIRST_ROW + len(prefixes) - 1
+    xy_rng = sheet.range(f"{XY}{FIRST_ROW}:C{last}")
+    xy = _grid(xy_rng.value, len(prefixes), 2)
+    ut = _utilization(sheet, len(prefixes))           # the same read get_utilization() uses
+
+    values: list[float] = []
+    for i in range(len(prefixes)):
+        values += [_number(xy[i][0], _cell(xy_rng, i, 0)),
+                   _number(xy[i][1], _cell(xy_rng, i, 1)),
+                   *ut[i]]
+
+    text = RECORDS_CSV.read_text(encoding="utf-8")
+    header = next(csv.reader(text.splitlines()), None)
+    if header is None:
+        raise RuntimeError(f"'{RECORDS_CSV}' has no header row to line up with")
+    if len(values) != len(header):
+        raise ValueError(
+            f"{len(values)} value(s) read from '{SHEET}' but '{RECORDS_CSV.name}' "
+            f"has {len(header)} column(s) - refusing to append a misaligned row"
+        )
+    for i, prefix in enumerate(prefixes):
+        if not header[PER_PILE * i].startswith(prefix):
+            raise ValueError(
+                f"pile {i + 1} in '{SHEET}' is '{prefix}' but column "
+                f"{PER_PILE * i + 1} of '{RECORDS_CSV.name}' is "
+                f"'{header[PER_PILE * i]}' - refusing to append a misaligned row"
+            )
+
+    with open(RECORDS_CSV, "a", newline="", encoding="utf-8") as csv_file:
+        if text and not text.endswith("\n"):          # never glue onto the last row
+            csv_file.write("\n")
+        csv.writer(csv_file).writerow(values)
+    return values
+
+
+PileRecord = tuple[str, float, float, float, float, float]
+                                # (pile name, x, y, util_nw, util_w, tension)
+
+
+def read_test_records(path: Path | str | None = None) -> list[list[PileRecord]]:
+    """Read the records CSV back as one tuple per pile per row.
+
+    Returns one list per DATA row (header excluded, blank lines skipped), each
+    holding one tuple per pile in the CSV's column order:
+    (pile name, x, y, util_nw, util_w, tension) - the name being the column key
+    before '~' ('BP01~x' -> 'BP01'). Defaults to data/SWTKT_test_records.csv;
+    a header-only file gives []; values arrive as floats, never as strings.
+    """
+    PER_PILE = 5                                     # x, y, util_nw, util_w, tension
+
+    csv_path = RECORDS_CSV if path is None else Path(path)
+    with open(csv_path, newline="", encoding="utf-8") as csv_file:
+        rows = list(csv.reader(csv_file))
+    if not rows:
+        raise RuntimeError(f"'{csv_path}' is empty - it has no header row")
+
+    header = rows[0]
+    if len(header) % PER_PILE:
+        raise ValueError(
+            f"'{csv_path.name}' has {len(header)} column(s), which is not a "
+            f"multiple of {PER_PILE}"
+        )
+    names = [header[g * PER_PILE].split("~")[0] for g in range(len(header) // PER_PILE)]
+
+    out: list[list[PileRecord]] = []
+    for line, cells in enumerate(rows[1:], start=2):  # the header is line 1
+        if not cells:
+            continue                                 # blank line - nothing to read
+        if len(cells) != len(header):
+            raise ValueError(
+                f"line {line} of '{csv_path.name}' has {len(cells)} column(s) but "
+                f"the header has {len(header)}"
+            )
+        piles: list[PileRecord] = []
+        for g, name in enumerate(names):
+            first = g * PER_PILE
+            values = [_number(cells[first + k],
+                              f"{csv_path.name} line {line} column {first + k + 1}")
+                      for k in range(PER_PILE)]
+            x, y, util_nw, util_w, tension = values
+            piles.append((name, x, y, util_nw, util_w, tension))
+        out.append(piles)
     return out
+
+
+def print_vba_log() -> str:
+    """Print the workbook's shared VBA log (SAFE_Library) to stdout; return it too.
+
+    The SAFE_Use subs report failures by logging instead of raising, so a macro
+    that ran but did nothing is only visible here. Read-only - it never clears.
+    """
+    MACRO = "SAFE_Library.GetLog"                    # returns the whole log as one string
+
+    try:
+        text = _book(WORKBOOK).macro(MACRO)() or ""
+    except Exception as exc:
+        raise RuntimeError(
+            f"macro '{MACRO}' failed: {exc}. The log lives in SAFE_Library, so "
+            "that module has to be imported into the workbook."
+        ) from exc
+
+    print(text)
+    return text
