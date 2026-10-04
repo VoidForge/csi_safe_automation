@@ -16,8 +16,11 @@ hardcoded at the top of each function.
 from __future__ import annotations
 
 import csv
+import time
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import xlwings as xw
 
@@ -28,6 +31,35 @@ RECORDS_CSV = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv
 
 _wb: xw.Book | None = None      # workbook found on the first call, kept for the session
 _n_coords = 0                   # rows written by the last write_coords() call
+
+
+# ---------------------------------------------------------------------------
+# Excel OLE call log
+# ---------------------------------------------------------------------------
+def _stamp() -> str:
+    """Local wall-clock time of an OLE call, to the millisecond."""
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+@contextmanager
+def _ole(label: str) -> Iterator[None]:
+    """Log one Excel OLE call to stdout with its time and duration.
+
+    One line is printed when the call goes out and one when it comes back, so a
+    call that is still running (a long SAFE analysis, say) is visible rather
+    than silent. A call that raises is marked '!!' with the exception type.
+    """
+    started = time.perf_counter()
+    print(f"{_stamp()}  OLE -> {label}", flush=True)
+    try:
+        yield
+    except BaseException as exc:
+        print(f"{_stamp()}  OLE !! {label}  "
+              f"({time.perf_counter() - started:.3f}s, {type(exc).__name__})",
+              flush=True)
+        raise
+    print(f"{_stamp()}  OLE <- {label}  ({time.perf_counter() - started:.3f}s)",
+          flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -43,27 +75,29 @@ def _book(workbook: str) -> xw.Book:
         except Exception:
             _wb = None
 
-    try:
-        apps = list(xw.apps)
-    except Exception as exc:
-        raise RuntimeError(
-            "no running Excel instance found - open the workbook first"
-        ) from exc
+    with _ole(f"attach to Excel workbook '{workbook}'"):
+        try:
+            apps = list(xw.apps)
+        except Exception as exc:
+            raise RuntimeError(
+                "no running Excel instance found - open the workbook first"
+            ) from exc
 
-    for app in apps:
-        for book in app.books:
-            if book.name.lower() == workbook.lower():
-                _wb = book
-                return _wb
-    raise RuntimeError(
-        f"workbook '{workbook}' is not open in Excel - open it and call again"
-    )
+        for app in apps:
+            for book in app.books:
+                if book.name.lower() == workbook.lower():
+                    _wb = book
+                    return _wb
+        raise RuntimeError(
+            f"workbook '{workbook}' is not open in Excel - open it and call again"
+        )
 
 
 def _run_macro(book: xw.Book, macro_name: str) -> None:
     """Run one VBA macro; a macro that cannot be run raises RuntimeError."""
     try:
-        book.macro(macro_name)()
+        with _ole(f"run macro '{macro_name}'"):
+            book.macro(macro_name)()
     except Exception as exc:
         raise RuntimeError(
             f"macro '{macro_name}' failed: {exc}. The SAFE_Use subs log their own "
@@ -104,12 +138,13 @@ def _cell(rng: xw.Range, r: int, c: int) -> str:
     return xw.utils.col_name(rng.column + c) + str(rng.row + r)
 
 
-def _utilization(sheet: xw.Sheet, n_rows: int) -> list[list[float]]:
-    """Read n_rows of 'Pile Coords' H:J as (util_nw, util_w, tension) triples."""
-    rng = sheet.range("H3").resize(n_rows, 3)         # H util w/o wind, I util w/ wind,
-    grid = _grid(rng.value, n_rows, 3)                # J tension surplus (kN)
-    return [[_number(grid[r][c], _cell(rng, r, c)) for c in range(3)]
-            for r in range(n_rows)]
+def _utilization(book: xw.Book, sheet_name: str, n_rows: int) -> list[list[float]]:
+    """Read n_rows of sheet_name's H:J as (util_nw, util_w, tension) triples."""
+    with _ole(f"read '{sheet_name}'!H3:J{n_rows + 2} utilization"):
+        rng = book.sheets[sheet_name].range("H3").resize(n_rows, 3)   # H util w/o wind,
+        grid = _grid(rng.value, n_rows, 3)              # I util w/ wind, J tension (kN)
+        return [[_number(grid[r][c], _cell(rng, r, c)) for c in range(3)]
+                for r in range(n_rows)]
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +168,8 @@ def write_coords(coords: list[list[float]]) -> None:
                      _number(pair[1], f"coords[{i}][1]")])
 
     book = _book(WORKBOOK)
-    book.sheets[SHEET].range(FIRST_CELL).resize(len(rows), 2).value = rows
+    with _ole(f"write '{SHEET}'!{FIRST_CELL} ({len(rows)} pile(s), x|y)"):
+        book.sheets[SHEET].range(FIRST_CELL).resize(len(rows), 2).value = rows
     _run_macro(book, MACRO)
     _n_coords = len(rows)
 
@@ -162,7 +198,7 @@ def get_utilization() -> list[list[float]]:
             "unknown - call write_coords() first"
         )
 
-    return _utilization(_book(WORKBOOK).sheets[SHEET], _n_coords)
+    return _utilization(_book(WORKBOOK), SHEET, _n_coords)
 
 
 def write_test_record() -> list[float]:
@@ -178,21 +214,24 @@ def write_test_record() -> list[float]:
     XY = "B"                                         # x in B, y in C (A = prefix)
     PER_PILE = 5                                     # x, y, util_nw, util_w, tension
 
-    sheet = _book(WORKBOOK).sheets[SHEET]
+    book = _book(WORKBOOK)
 
-    raw = sheet.range(f"A{FIRST_ROW}").expand("down").value
-    raw = raw if isinstance(raw, list) else [raw]     # one pile comes back as a scalar
-    prefixes = ["" if p is None else str(p).strip() for p in raw]
-    if not prefixes or not all(prefixes):
-        raise RuntimeError(
-            f"no pile prefixes found in '{SHEET}'!A{FIRST_ROW} downwards - the "
-            "coordinate table is expected in A (prefix), B (x), C (y)"
-        )
+    with _ole(f"read '{SHEET}' pile table"):
+        sheet = book.sheets[SHEET]
+        raw = sheet.range(f"A{FIRST_ROW}").expand("down").value
+        raw = raw if isinstance(raw, list) else [raw]  # one pile comes back as a scalar
+        prefixes = ["" if p is None else str(p).strip() for p in raw]
+        if not prefixes or not all(prefixes):
+            raise RuntimeError(
+                f"no pile prefixes found in '{SHEET}'!A{FIRST_ROW} downwards - the "
+                "coordinate table is expected in A (prefix), B (x), C (y)"
+            )
 
-    last = FIRST_ROW + len(prefixes) - 1
-    xy_rng = sheet.range(f"{XY}{FIRST_ROW}:C{last}")
-    xy = _grid(xy_rng.value, len(prefixes), 2)
-    ut = _utilization(sheet, len(prefixes))           # the same read get_utilization() uses
+        last = FIRST_ROW + len(prefixes) - 1
+        xy_rng = sheet.range(f"{XY}{FIRST_ROW}:C{last}")
+        xy = _grid(xy_rng.value, len(prefixes), 2)
+
+    ut = _utilization(book, SHEET, len(prefixes))     # the same read get_utilization() uses
 
     values: list[float] = []
     for i in range(len(prefixes)):
@@ -283,7 +322,8 @@ def print_vba_log() -> str:
     MACRO = "SAFE_Library.GetLog"                    # returns the whole log as one string
 
     try:
-        text = _book(WORKBOOK).macro(MACRO)() or ""
+        with _ole(f"run macro '{MACRO}'"):
+            text = _book(WORKBOOK).macro(MACRO)() or ""
     except Exception as exc:
         raise RuntimeError(
             f"macro '{MACRO}' failed: {exc}. The log lives in SAFE_Library, so "
@@ -292,3 +332,32 @@ def print_vba_log() -> str:
 
     print(text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Excel quiet mode
+# ---------------------------------------------------------------------------
+@contextmanager
+def quiet_excel() -> Iterator[None]:
+    """Silence Excel's screen updates and alerts for the duration of a block.
+
+    Long stretches of SAFE work keep Excel parked inside an outbound OLE call,
+    and while it is parked any message its window receives makes it put up
+    "Microsoft Excel is waiting for another application to complete an OLE
+    action". Dropping repaint and alert traffic removes most of the messages
+    that trigger it. Only these two settings are touched - events, calculation
+    mode and the model are left alone - and the values found on entry are put
+    back on every exit path, so a failure inside the block cannot leave Excel
+    stuck looking frozen.
+    """
+    app = _book(WORKBOOK).app
+    with _ole("silence Excel screen updates and alerts"):
+        saved = (app.api.ScreenUpdating, app.api.DisplayAlerts)
+        app.api.ScreenUpdating = False
+        app.api.DisplayAlerts = False
+    try:
+        yield
+    finally:
+        with _ole("restore Excel screen updates and alerts"):
+            app.api.ScreenUpdating = saved[0]
+            app.api.DisplayAlerts = saved[1]
