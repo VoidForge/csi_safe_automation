@@ -201,18 +201,17 @@ def get_utilization() -> list[list[float]]:
     return _utilization(_book(WORKBOOK), SHEET, _n_coords)
 
 
-def write_test_record() -> list[float]:
-    """Append the workbook's current pile values as a new row in the records CSV.
+def read_pile_values() -> tuple[list[str], list[float]]:
+    """Read 'Pile Coords' into (pile prefixes, flat CSV-ordered values).
 
-    Reads 'Pile Coords' (A = pile prefix, B:C = x and y, H:J = utilization w/o
-    wind, utilization w/ wind and tension surplus) and appends the values to the
-    BOTTOM of data/SWTKT_test_records.csv - five per pile, in the CSV's own column
-    order, which the header is checked against first. Returns the row appended.
+    One round trip for the whole table: the prefix column A downwards, the x and
+    y in B:C, and the utilization w/o wind, utilization w/ wind and tension
+    surplus in H:J - five numbers per pile, in the records CSV's own column
+    order. Nothing is written anywhere and no CSV is touched.
     """
     SHEET = "Pile Coords"
     FIRST_ROW = 3                                    # sheet row of the first pile
     XY = "B"                                         # x in B, y in C (A = prefix)
-    PER_PILE = 5                                     # x, y, util_nw, util_w, tension
 
     book = _book(WORKBOOK)
 
@@ -238,29 +237,58 @@ def write_test_record() -> list[float]:
         values += [_number(xy[i][0], _cell(xy_rng, i, 0)),
                    _number(xy[i][1], _cell(xy_rng, i, 1)),
                    *ut[i]]
+    return prefixes, values
 
-    text = RECORDS_CSV.read_text(encoding="utf-8")
+
+def append_test_record(values: list[float], prefixes: list[str] | None = None,
+                       path: Path | str | None = None) -> list[float]:
+    """Append one flat row of `values` to the BOTTOM of a records CSV.
+
+    `values` is the CSV-ordered row that read_pile_values() returns (five numbers
+    per pile); `path` is the CSV to append to and defaults to the workbook's own
+    data/SWTKT_test_records.csv. The row is checked against that file's own header
+    first: the number of values has to match the column count and, when
+    `prefixes` is given, each pile prefix has to line up with its columns, so a
+    misaligned row is refused rather than appended. Returns the row it appended.
+    """
+    PER_PILE = 5                                     # x, y, util_nw, util_w, tension
+
+    csv_path = RECORDS_CSV if path is None else Path(path)
+    text = csv_path.read_text(encoding="utf-8")
     header = next(csv.reader(text.splitlines()), None)
     if header is None:
-        raise RuntimeError(f"'{RECORDS_CSV}' has no header row to line up with")
+        raise RuntimeError(f"'{csv_path}' has no header row to line up with")
     if len(values) != len(header):
         raise ValueError(
-            f"{len(values)} value(s) read from '{SHEET}' but '{RECORDS_CSV.name}' "
-            f"has {len(header)} column(s) - refusing to append a misaligned row"
+            f"{len(values)} value(s) to append but '{csv_path.name}' has "
+            f"{len(header)} column(s) - refusing to append a misaligned row"
         )
-    for i, prefix in enumerate(prefixes):
-        if not header[PER_PILE * i].startswith(prefix):
-            raise ValueError(
-                f"pile {i + 1} in '{SHEET}' is '{prefix}' but column "
-                f"{PER_PILE * i + 1} of '{RECORDS_CSV.name}' is "
-                f"'{header[PER_PILE * i]}' - refusing to append a misaligned row"
-            )
+    if prefixes is not None:
+        for i, prefix in enumerate(prefixes):
+            if not header[PER_PILE * i].startswith(prefix):
+                raise ValueError(
+                    f"pile {i + 1} is '{prefix}' but column "
+                    f"{PER_PILE * i + 1} of '{csv_path.name}' is "
+                    f"'{header[PER_PILE * i]}' - refusing to append a misaligned row"
+                )
 
-    with open(RECORDS_CSV, "a", newline="", encoding="utf-8") as csv_file:
+    with open(csv_path, "a", newline="", encoding="utf-8") as csv_file:
         if text and not text.endswith("\n"):          # never glue onto the last row
             csv_file.write("\n")
         csv.writer(csv_file).writerow(values)
     return values
+
+
+def write_test_record() -> list[float]:
+    """Append the workbook's current pile values as a new row in the records CSV.
+
+    Reads 'Pile Coords' (A = pile prefix, B:C = x and y, H:J = utilization w/o
+    wind, utilization w/ wind and tension surplus) and appends the values to the
+    BOTTOM of data/SWTKT_test_records.csv - five per pile, in the CSV's own column
+    order, which the header is checked against first. Returns the row appended.
+    """
+    prefixes, values = read_pile_values()
+    return append_test_record(values, prefixes)
 
 
 PileRecord = tuple[str, float, float, float, float, float]

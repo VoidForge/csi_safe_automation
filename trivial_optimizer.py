@@ -5,24 +5,28 @@ Every iteration moves ONE pile and keeps the best of eight trial moves:
   1. Pick the pile with the highest governing utilization, where a pile's
      governing utilization is the worse of its two cases:
      ``max(utilization without wind, utilization with wind)``.
-  2. Move that pile by ``STEP_SIZE`` in each of the eight compass directions
-     and analyse every candidate. A trial is appended to the run-records CSV
-     the moment it has been analysed (`auto_analysis.write_test_record`), so an
-     interrupted run keeps every trial it had reached.
-  3. Finish the iteration by reading the records CSV back and taking its best
-     row (lowest highest-utilization) as the next baseline. Nothing has to be
-     re-analysed to register a baseline: the accepted layout is already a row.
-  4. If that best row is no better than the baseline the iteration started
-     from, raise `NoImprovementError` - the layout is a local optimum at this
-     step size.
+  2. Move that pile by ``STEP_SIZE`` in each of the eight compass directions. A
+     candidate whose exact coordinates are already in the record store is
+     skipped - its result is known, so no analysis runs and no row is appended.
+     Every other candidate is analysed and its row is appended to `RECORDS_CSV`
+     immediately (`auto_analysis.append_test_record`), so an interrupted run
+     keeps every trial it had reached.
+  3. The `RecordStore` mirrors that CSV in memory: each trial's row is added to it
+     as it is recorded, and the next baseline is its best row (lowest highest
+     utilization). Nothing is re-read from disk during a run.
+  4. If that best row is no better than the baseline the iteration started from,
+     raise `NoImprovementError` - the layout is a local optimum at this step
+     size. That is also what an iteration whose candidates were all tried before
+     reports.
 
 The pile count and pile order come from the records CSV header, so nothing here
 assumes 22 piles. All model-specific knowledge is confined to the "model glue"
-block below - swapping that block (STEP_SIZE, DIRECTIONS, evaluate) is all it
-takes to point the optimizer at another model.
+block below - `RECORDS_CSV`, `STEP_SIZE`, `DIRECTIONS` and `evaluate` - so
+swapping that block is all it takes to point the optimizer at another model.
 
-The CSV is both the log and the working memory: every iteration starts from the
-best row it already holds, and normally that is the layout the workbook shows.
+A recorded row is only valid for the model it was measured against, so a model
+edit or a changed STEP_SIZE makes older rows stale - they can be both the
+baseline and the thing that marks a candidate "already tried".
 
 Requirements: the workbook must already be open in Excel and SAFE must be
 running with the model loaded.
@@ -32,7 +36,6 @@ Run it with:  python trivial_optimizer.py
 
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -41,6 +44,8 @@ import auto_analysis as aa
 # ---------------------------------------------------------------------------
 # model glue - the only part that knows about the Auto Piling model.
 # ---------------------------------------------------------------------------
+RECORDS_CSV: Path = aa.RECORDS_CSV              # run-records log: read back, appended to
+
 STEP_SIZE = 500.0                               # trial move distance, model units
 
 DIRECTIONS: tuple[tuple[int, int], ...] = (     # eight compass directions
@@ -54,99 +59,138 @@ DIRECTIONS: tuple[tuple[int, int], ...] = (     # eight compass directions
     (1, -1),                                    # SE
 )
 
-RECORDS_CSV = aa.RECORDS_CSV                    # the run-records log (one row per trial)
-PER_PILE = 5                                    # x, y, util_nw, util_w, tension
-FIELD_NAMES = ("x", "y", "util_nw", "util_w", "tension")   # per pile, in that order
+DUP_DECIMALS = 6                                # rounding used for the "already tried" test
+CSV_FIELDS_PER_PILE = 5                         # x, y, util_nw, util_w, tension per CSV row
+
+PILE_NAME, PILE_X, PILE_Y, PILE_UTIL_NW, PILE_UTIL_W, PILE_TENSION = range(6)
+                                # the field order of auto_analysis.PileRecord
 
 
-def evaluate(coords: list[list[float]]) -> list[list[float]]:
-    """Push `coords` into the model, analyse it, record it, and return results.
+def evaluate(coords: list[list[float]]) -> list[float]:
+    """Push `coords` into the model, analyse it, and record the trial.
 
-    Returns one ``(util_nw, util_w, tension)`` triple per pile, in pile order.
-    The trial row is appended to the records CSV right after the analysis, so
-    every analysed candidate is on disk before the next one starts.
+    Returns the flat row just appended to `RECORDS_CSV` - five numbers per pile,
+    in the CSV's own order. The utilization comes from that row instead of a
+    second sheet read, so a trial costs one Excel read. The caller puts the row
+    into the `RecordStore`.
     """
     aa.write_coords(coords)
     aa.run_analysis()
     aa.write_reactions()
-    utilization = aa.get_utilization()
-    aa.write_test_record()                      # each trial is recorded immediately
-    return utilization
+    prefixes, values = aa.read_pile_values()    # one Excel round trip for the table
+    return aa.append_test_record(values, prefixes, path=RECORDS_CSV)
 # ---------------------------------------------------------------------------
 # end model glue
 # ---------------------------------------------------------------------------
 
 
-def read_records(path: Path = RECORDS_CSV) -> list[list[list[float]]]:
-    """Read every row of the records CSV as per-pile value groups.
+def key_of(coords: list[list[float]]) -> tuple[float, ...]:
+    """Hashable identity of a layout: every coordinate, rounded to DUP_DECIMALS.
 
-    The header fixes the pile count and the field order, so both come from the
-    data rather than from an assumption. Each row comes back as one
-    ``[x, y, util_nw, util_w, tension]`` list per pile. A row of the wrong width
-    or a cell that is not a number is refused rather than guessed at.
+    Coordinates make a round trip through Excel and the CSV text, so an exact
+    float comparison would miss a repeat that differs in the last bit; rounding
+    well below the model's precision makes the test reliable.
     """
-    with open(path, newline="", encoding="utf-8") as csv_file:
-        rows = list(csv.reader(csv_file))
-    if not rows:
-        raise RuntimeError(f"'{path}' has no header row")
+    return tuple(round(value, DUP_DECIMALS) for pair in coords for value in pair)
 
-    header = rows[0]
-    if not header or len(header) % PER_PILE:
-        raise ValueError(
-            f"'{path.name}' header has {len(header)} column(s), not a positive "
-            f"multiple of {PER_PILE} - cannot work out the piles"
-        )
-    for i, name in enumerate(header):
-        if name.rsplit("~", 1)[-1] != FIELD_NAMES[i % PER_PILE]:
-            raise ValueError(
-                f"'{path.name}' column {i + 1} is '{name}', expected a "
-                f"'~{FIELD_NAMES[i % PER_PILE]}' column - refusing to read it"
-            )
-    n_piles = len(header) // PER_PILE
 
-    records: list[list[list[float]]] = []
-    for row_number, row in enumerate(rows[1:], start=2):
-        if not row or all(cell.strip() == "" for cell in row):
-            continue
-        if len(row) != len(header):
-            raise ValueError(
-                f"'{path.name}' row {row_number} has {len(row)} value(s) but the "
-                f"header has {len(header)} - refusing to read a misaligned row"
+class RecordStore:
+    """Every recorded trial in memory, indexed by the layouts already tried.
+
+    The records CSV stays the durable log - every trial is still appended to it -
+    and this is the copy the optimizer works from, so an iteration never re-reads
+    the file. Rows are keyed by their whole pile-coordinate set (`key_of`), so a
+    candidate whose layout has already been analysed is recognised without
+    touching Excel again.
+    """
+
+    def __init__(self, rows: list[list[aa.PileRecord]]) -> None:
+        if not rows:
+            raise RuntimeError(
+                "no recorded trial to work from - the records CSV needs at least "
+                "one row before the optimizer can start"
             )
-        values: list[float] = []
-        for cell in row:
-            try:
-                values.append(float(cell))
-            except ValueError as exc:
+        self.rows: list[list[aa.PileRecord]] = [list(row) for row in rows]
+        self.names: list[str] = [str(pile[PILE_NAME]) for pile in self.rows[0]]
+
+        self._index: dict[tuple[float, ...], list[aa.PileRecord]] = {}
+        counts: dict[tuple[float, ...], int] = {}
+        for row in self.rows:
+            if len(row) != len(self.names):
                 raise ValueError(
-                    f"'{path.name}' row {row_number} has a non-numeric value "
-                    f"{cell!r}"
-                ) from exc
-        records.append([values[PER_PILE * p:PER_PILE * (p + 1)]
-                        for p in range(n_piles)])
-    if not records:
-        raise RuntimeError(f"'{path}' holds no records to optimize from")
-    return records
+                    f"a recorded row holds {len(row)} pile(s) but the first one "
+                    f"holds {len(self.names)} - refusing to index them together"
+                )
+            key = key_of(record_coords(row))
+            counts[key] = counts.get(key, 0) + 1
+            held = self._index.get(key)
+            if held is None or record_peak(row) < record_peak(held):
+                self._index[key] = row             # of repeats, keep the best result
+        self.duplicate_keys = sum(1 for n in counts.values() if n > 1)
+
+    @classmethod
+    def load(cls, path: Path | str = RECORDS_CSV) -> "RecordStore":
+        """Read a records CSV (default `RECORDS_CSV`) into a store."""
+        return cls(aa.read_test_records(path))
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def best(self) -> list[aa.PileRecord]:
+        """The recorded row with the lowest highest-utilization (ties: earliest)."""
+        return best_record(self.rows)
+
+    def find(self, coords: list[list[float]]) -> list[aa.PileRecord] | None:
+        """The recorded row for these exact coordinates, or None if untried."""
+        return self._index.get(key_of(coords))
+
+    def add(self, values: list[float]) -> list[aa.PileRecord]:
+        """Add a flat CSV-order row - the one just appended to the records CSV."""
+        if len(values) != CSV_FIELDS_PER_PILE * len(self.names):
+            raise ValueError(
+                f"{len(values)} recorded value(s) but the store holds "
+                f"{len(self.names)} pile(s) of {CSV_FIELDS_PER_PILE} values - "
+                "refusing to add a misaligned row"
+            )
+
+        row: list[aa.PileRecord] = []
+        for i, name in enumerate(self.names):
+            base = CSV_FIELDS_PER_PILE * i
+            x, y, util_nw, util_w, tension = values[base:base + CSV_FIELDS_PER_PILE]
+            row.append((name, x, y, util_nw, util_w, tension))
+
+        self.rows.append(row)
+        key = key_of(record_coords(row))
+        held = self._index.get(key)
+        if held is None:
+            self._index[key] = row
+        else:
+            self.duplicate_keys += 1
+            if record_peak(row) < record_peak(held):
+                self._index[key] = row
+        return row
 
 
-def record_coords(record: list[list[float]]) -> list[list[float]]:
+def record_coords(record: list[aa.PileRecord]) -> list[list[float]]:
     """The (x, y) coordinates of one records-CSV row."""
-    return [[pile[0], pile[1]] for pile in record]
+    return [[float(pile[PILE_X]), float(pile[PILE_Y])] for pile in record]
 
 
-def record_utilization(record: list[list[float]]) -> list[list[float]]:
+def record_utilization(record: list[aa.PileRecord]) -> list[list[float]]:
     """The (util_nw, util_w, tension) triples of one records-CSV row."""
-    return [[pile[2], pile[3], pile[4]] for pile in record]
+    return [[float(pile[PILE_UTIL_NW]), float(pile[PILE_UTIL_W]),
+             float(pile[PILE_TENSION])] for pile in record]
 
 
-def record_peak(record: list[list[float]]) -> float:
+def record_peak(record: list[aa.PileRecord]) -> float:
     """Highest governing utilization of one records-CSV row."""
-    return max(max(pile[2], pile[3]) for pile in record)
+    return max(max(float(pile[PILE_UTIL_NW]), float(pile[PILE_UTIL_W]))
+               for pile in record)
 
 
-def best_record(records: list[list[list[float]]]) -> list[list[float]]:
-    """The record with the lowest highest-utilization (ties keep the earliest)."""
-    return min(records, key=record_peak)
+def best_record(rows: list[list[aa.PileRecord]]) -> list[aa.PileRecord]:
+    """The row with the lowest highest-utilization (ties keep the earliest)."""
+    return min(rows, key=record_peak)
 
 
 def governing(utilization: list[list[float]]) -> list[float]:
@@ -194,25 +238,26 @@ class NoImprovementError(RuntimeError):
 
 
 def optimize(*,
+             store: RecordStore | None = None,
              step_size: float = STEP_SIZE,
              directions: Sequence[tuple[int, int]] = DIRECTIONS,
-             evaluate_fn: Callable[[list[list[float]]], list[list[float]]] = evaluate,
-             read_fn: Callable[[], list[list[list[float]]]] = read_records,
+             evaluate_fn: Callable[[list[list[float]]], list[float]] = evaluate,
              max_iterations: int | None = None,
              log: Callable[[str], None] = print,
              ) -> tuple[list[list[float]], list[list[float]], int]:
     """Hill-climb the pile layout, one pile and one step per iteration.
 
-    Every iteration starts from the best row the records CSV holds and finishes
-    by reading that CSV back, so the accepted layout never has to be re-analysed
-    to register a baseline. Returns the best ``(coords, utilization,
-    iterations)``; raises `NoImprovementError` when an iteration's eight trials
-    fail to beat the baseline.
+    Starts from the store's best row and works from the store throughout, so a
+    layout that has already been analysed is never analysed again. Returns the
+    best ``(coords, utilization, iterations)``; raises `NoImprovementError` when
+    the iteration's candidates all fail to beat the baseline.
     """
+    if store is None:
+        store = RecordStore.load()
     iterations = 0
 
     while max_iterations is None or iterations < max_iterations:
-        baseline = best_record(read_fn())
+        baseline = store.best()
         coords = record_coords(baseline)
         utilization = record_utilization(baseline)
         current_peak = record_peak(baseline)
@@ -223,10 +268,15 @@ def optimize(*,
 
         for direction in directions:
             trial_coords = move_pile(coords, pile_index, direction, step_size)
-            trial_peak = peak(evaluate_fn(trial_coords))
-            log(f"  {direction}: highest utilization {trial_peak:.6g}")
+            known = store.find(trial_coords)
+            if known is not None:
+                log(f"  {direction}: already tried (highest utilization "
+                    f"{record_peak(known):.6g}) - skipped")
+                continue
+            record = store.add(evaluate_fn(trial_coords))
+            log(f"  {direction}: highest utilization {record_peak(record):.6g}")
 
-        accepted = best_record(read_fn())                # the CSV is the memory
+        accepted = store.best()                          # the store is the memory
         if record_peak(accepted) >= current_peak:
             raise NoImprovementError(pile_index, record_coords(accepted),
                                      record_utilization(accepted), iterations,
@@ -235,19 +285,20 @@ def optimize(*,
         log(f"  accepted the best of the eight -> highest utilization "
             f"{record_peak(accepted):.6g}")
 
-    best = best_record(read_fn())
+    best = store.best()
     return record_coords(best), record_utilization(best), iterations
 
 
 def main() -> None:
     """Optimize from the best layout the records CSV already holds."""
-    baseline = best_record(read_records())
-    print(f"{len(baseline)} piles, best recorded highest utilization "
-          f"{record_peak(baseline):.6g}, step size {STEP_SIZE:g}")
+    store = RecordStore.load()
+    print(f"{RECORDS_CSV.name}: {len(store.names)} piles, {len(store)} recorded "
+          f"layout(s), {store.duplicate_keys} repeated, best highest utilization "
+          f"{record_peak(store.best()):.6g}, step size {STEP_SIZE:g}")
 
     try:
         with aa.quiet_excel():                       # fewer Excel messages: fewer OLE prompts
-            coords, utilization, iterations = optimize()
+            coords, utilization, iterations = optimize(store=store)
     except NoImprovementError as exc:
         print(exc)
         print(f"stopped after {exc.iterations} accepted move(s) at highest "
