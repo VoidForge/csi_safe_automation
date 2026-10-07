@@ -8,12 +8,18 @@ scipy (Qhull via `scipy.spatial.Voronoi`) only.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TypeAlias
 
 import numpy as np
 from scipy.spatial import QhullError, Voronoi
 
+# Points reach these functions either as the plain list of pairs a caller builds or as
+# the numpy array an earlier step handed back. A numpy array is not a Sequence, so the
+# public annotations have to name both.
+Points: TypeAlias = Sequence[Sequence[float]] | np.ndarray
 
-def _ring(polygon: Sequence[Sequence[float]]) -> tuple[np.ndarray, float]:
+
+def _ring(polygon: Points) -> tuple[np.ndarray, float]:
     """Counter-clockwise boundary ring of `polygon` and its doubled area."""
     poly = np.asarray(polygon, dtype=float)
     if poly.ndim != 2 or poly.shape[1] != 2 or len(poly) < 3:
@@ -107,7 +113,7 @@ def _clip(pts: np.ndarray, s: np.ndarray) -> np.ndarray:
 
 
 def lloyd_cvt(
-    polygon: Sequence[Sequence[float]],
+    polygon: Points,
     n: int,
     *,
     seed: int | None = None,
@@ -200,8 +206,8 @@ def lloyd_cvt(
 
 
 def validate(
-    polygon: Sequence[Sequence[float]],
-    sites: Sequence[Sequence[float]],
+    polygon: Points,
+    sites: Points,
     tol: float = 1e-3,
 ) -> list[str]:
     """List what is wrong with `sites` as a tessellation of `polygon`; empty means fine.
@@ -245,9 +251,7 @@ def validate(
     return bad
 
 
-def area_spread(
-    polygon: Sequence[Sequence[float]], sites: Sequence[Sequence[float]]
-) -> tuple[list[float], float]:
+def area_spread(polygon: Points, sites: Points) -> tuple[list[float], float]:
     """Cell areas and their spread (max - min) / (polygon area / number of cells)."""
     poly, poly_area2 = _ring(polygon)
     areas = np.array([_area(c) for c in _cells(poly, np.asarray(sites, dtype=float))])
@@ -255,7 +259,7 @@ def area_spread(
 
 
 def best_cvt(
-    polygon: Sequence[Sequence[float]],
+    polygon: Points,
     n: int,
     k: int = 8,
     *,
@@ -288,7 +292,7 @@ def best_cvt(
     return best
 
 
-def energy(polygon: Sequence[Sequence[float]], sites: Sequence[Sequence[float]]) -> float:
+def energy(polygon: Points, sites: Points) -> float:
     """CVT energy of the tessellation, sum_i integral over cell i of |x - site_i|^2 dA."""
     poly, _ = _ring(polygon)
     pts = np.asarray(sites, dtype=float)

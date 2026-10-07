@@ -6,6 +6,9 @@ running with the model loaded. Intended order of calls:
 
     write_coords(coords)  ->  run_analysis()  ->  write_reactions()  ->  get_utilization()
 
+init_pile_layout(polygon, weights=None) generates `coords` with weighted_cvt and
+can stand in for the write_coords() call.
+
 get_utilization() hands the results back; write_test_record() appends them to the
 records CSV; print_vba_log() prints the workbook's own log.
 
@@ -20,7 +23,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import xlwings as xw
 
@@ -138,6 +141,30 @@ def _cell(rng: xw.Range, r: int, c: int) -> str:
     return xw.utils.col_name(rng.column + c) + str(rng.row + r)
 
 
+def _pile_prefixes(sheet: xw.Sheet, first_row: int) -> list[str]:
+    """Pile prefixes in column A from `first_row` down the contiguous block.
+
+    The block ends at the first blank cell, which is also the row count a
+    coordinate write covers, so a blank row can never leave a prefix behind.
+    """
+    raw = sheet.range(f"A{first_row}").expand("down").value
+    raw = raw if isinstance(raw, list) else [raw]  # one pile comes back as a scalar
+    prefixes = ["" if p is None else str(p).strip() for p in raw]
+    if not prefixes or not all(prefixes):
+        raise RuntimeError(
+            f"no pile prefixes found in '{sheet.name}'!A{first_row} downwards - the "
+            "coordinate table is expected in A (prefix), B (x), C (y)"
+        )
+    return prefixes
+
+
+def _write_coords_range(book: xw.Book, sheet_name: str, first_cell: str,
+                        coords: list[list[float]]) -> None:
+    """Write (x, y) rows into sheet_name at first_cell, under one OLE log line."""
+    with _ole(f"write '{sheet_name}'!{first_cell} ({len(coords)} pile(s), x|y)"):
+        book.sheets[sheet_name].range(first_cell).resize(len(coords), 2).value = coords
+
+
 def _utilization(book: xw.Book, sheet_name: str, n_rows: int) -> list[list[float]]:
     """Read n_rows of sheet_name's H:J as (util_nw, util_w, tension) triples."""
     with _ole(f"read '{sheet_name}'!H3:J{n_rows + 2} utilization"):
@@ -168,10 +195,96 @@ def write_coords(coords: list[list[float]]) -> None:
                      _number(pair[1], f"coords[{i}][1]")])
 
     book = _book(WORKBOOK)
-    with _ole(f"write '{SHEET}'!{FIRST_CELL} ({len(rows)} pile(s), x|y)"):
-        book.sheets[SHEET].range(FIRST_CELL).resize(len(rows), 2).value = rows
+    _write_coords_range(book, SHEET, FIRST_CELL, rows)
     _run_macro(book, MACRO)
     _n_coords = len(rows)
+
+
+def init_pile_layout(polygon: Sequence[Sequence[float]],
+                     weights: Sequence[float] | None = None, *,
+                     n_piles: int | None = None,
+                     seed: int | None = None,
+                     best_of: int = 0,
+                     area_tol: float = 1e-3,
+                     allow_nonconverged: bool = False,
+                     apply: bool = True) -> list[list[float]]:
+    """Generate a pile layout on `polygon` and write it to the workbook.
+
+    `weighted_cvt` builds the layout: `polygon` is the convex cap outline, and
+    `weights` holds one area weight per pile, so a larger weight gives a larger
+    cell and a lighter pile. `weights=None` gives every pile the same area; the
+    pile count is then `n_piles`, or the prefixes already in 'Pile Coords' when
+    `n_piles` is None. Sites arrive ordered by descending y and then ascending x,
+    and the function writes them top to bottom onto the existing rows, so the
+    count has to match the prefix column. The prefixes themselves are not touched.
+
+    `best_of` and `area_tol` go through to `weighted_cvt` / `best_weighted_cvt`
+    (`best_of=0` is one deterministic start). A layout whose worst cell misses its
+    target area by more than `area_tol` of the cap area raises unless
+    `allow_nonconverged` is True. With `apply=True` (the default) the function
+    writes the coordinates and pushes them into SAFE through
+    `SAFE_Use.ApplyPileCoordinates1`. With `apply=False` it writes the sheet only
+    and leaves `_n_coords` alone, so `get_utilization()` stays tied to the last
+    `write_coords()` call.
+
+    Returns the coordinates written, in `write_coords()`'s own shape.
+    """
+    import weighted_cvt as wcvt              # numpy/scipy only when this runs
+
+    SHEET = "Pile Coords"
+    FIRST_CELL = "B3"                        # x in B, y in C, downwards
+    FIRST_ROW = 3                            # sheet row of the first pile
+
+    book = _book(WORKBOOK)
+    with _ole(f"read '{SHEET}' pile prefixes"):
+        prefixes = _pile_prefixes(book.sheets[SHEET], FIRST_ROW)
+
+    area_weights = None if weights is None else [float(w) for w in weights]
+    if area_weights is not None and n_piles is not None and n_piles != len(area_weights):
+        raise ValueError(
+            f"n_piles={n_piles} disagrees with the {len(area_weights)} weight(s)"
+        )
+    n = n_piles if area_weights is None else len(area_weights)
+    if n is None:
+        n = len(prefixes)                    # one pile per existing prefix
+    if n <= 0:
+        raise ValueError(f"a layout needs at least one pile, got {n}")
+    if n != len(prefixes):
+        raise ValueError(
+            f"the layout holds {n} pile(s) but '{SHEET}'!A{FIRST_ROW} holds "
+            f"{len(prefixes)} prefix(es) - refusing to write a layout that does not "
+            "line up with the sheet"
+        )
+    if area_weights is None:
+        area_weights = [1.0] * n             # equal areas
+
+    if best_of > 0:
+        result = wcvt.best_weighted_cvt(polygon, area_weights, k=best_of,
+                                        seed=seed, area_tol=area_tol)
+    else:
+        result = wcvt.weighted_cvt(polygon, area_weights,
+                                   seed=seed, area_tol=area_tol)
+
+    if not result.converged and not allow_nonconverged:
+        raise RuntimeError(
+            f"the layout did not reach the requested areas: the worst cell misses its "
+            f"target by {result.max_area_error:.3g} of the cap area after "
+            f"{result.iterations} iteration(s) (area_tol={area_tol:g}) - nothing was "
+            "written. Loosen area_tol, raise best_of, or pass allow_nonconverged=True."
+        )
+
+    print(f"{_stamp()}  init_pile_layout: {len(result.sites)} pile(s), "
+          f"{result.iterations} iteration(s), converged={result.converged}, worst "
+          f"area error {result.max_area_error:.3g} of the cap area; cells "
+          f"{min(result.areas):.6g}..{max(result.areas):.6g} vs targets "
+          f"{min(result.targets):.6g}..{max(result.targets):.6g}", flush=True)
+
+    coords = [[float(x), float(y)] for x, y in result.sites]
+    if apply:
+        write_coords(coords)                 # sheet write + ApplyPileCoordinates1
+    else:
+        _write_coords_range(book, SHEET, FIRST_CELL, coords)
+    return coords
 
 
 def run_analysis() -> None:
@@ -217,14 +330,7 @@ def read_pile_values() -> tuple[list[str], list[float]]:
 
     with _ole(f"read '{SHEET}' pile table"):
         sheet = book.sheets[SHEET]
-        raw = sheet.range(f"A{FIRST_ROW}").expand("down").value
-        raw = raw if isinstance(raw, list) else [raw]  # one pile comes back as a scalar
-        prefixes = ["" if p is None else str(p).strip() for p in raw]
-        if not prefixes or not all(prefixes):
-            raise RuntimeError(
-                f"no pile prefixes found in '{SHEET}'!A{FIRST_ROW} downwards - the "
-                "coordinate table is expected in A (prefix), B (x), C (y)"
-            )
+        prefixes = _pile_prefixes(sheet, FIRST_ROW)
 
         last = FIRST_ROW + len(prefixes) - 1
         xy_rng = sheet.range(f"{XY}{FIRST_ROW}:C{last}")

@@ -18,6 +18,7 @@ reference material they run against stay out of this repository.
 | `Interpolation2D.bas` | Standalone module: linear interpolation on scattered 2-D points. Calls nothing outside itself. |
 | `auto_analysis.py` | Python (xlwings) driver that runs the workbook's own macros in sequence and records the results. |
 | `lloyd_cvt.py` | Python: centroidal Voronoi tessellation of a convex polygon by Lloyd's algorithm. |
+| `weighted_cvt.py` | Python: power-diagram (Laguerre) tessellation of a convex polygon whose cell areas follow per-site weights. |
 | `rename_repo.bat` | Repairs the `origin` remote URL after the GitHub repository was renamed. |
 
 ## How to use
@@ -222,12 +223,30 @@ and every worksheet, cell and macro name is a constant inside the function that 
 it.
 
 ```python
+init_pile_layout(polygon, weights=None)   # optional first step: generate the layout
+
 write_coords(coords)  ->  run_analysis()  ->  write_reactions()  ->  get_utilization()
 ```
 
 - `write_coords(coords: list[list[float]])` writes the (x, y) pairs into the pile
   coordinate sheet, in columns B and C downwards, and leaves the name column in A
   alone. It then runs `SAFE_Use.ApplyPileCoordinates1`.
+- `init_pile_layout(polygon, weights=None, *, n_piles=None, seed=None, best_of=0,
+  area_tol=1e-3, allow_nonconverged=False, apply=True) -> list[list[float]]` generates a
+  layout with `weighted_cvt` and writes it in place of `write_coords`. `polygon` is the
+  convex cap outline, which the caller supplies because the workbook has no outline to
+  read yet. `weights` are the per-pile target areas: a larger weight means a larger cell
+  and a lighter pile, and the default `None` makes every pile equal. The pile count comes
+  from `weights`, then `n_piles`, then the prefixes already in `Pile Coords`!A, and it has
+  to match that prefix column; the function checks this before it writes anything. `seed`
+  and `best_of` go through to `weighted_cvt` / `best_weighted_cvt` (`best_of=0` is one
+  deterministic start). `area_tol` is the relative area tolerance: the worst cell may miss
+  its target by that fraction of the cap area, and a layout that misses it raises unless
+  `allow_nonconverged=True`. Sites go top to bottom onto the existing rows, so no pile is
+  renamed and the sheet fixes the count. With `apply=True` (the default) the coordinates
+  go into SAFE through `SAFE_Use.ApplyPileCoordinates1`; with `apply=False` only the sheet
+  is written. It returns the coordinates written, so `coords = init_pile_layout(CAP)` then
+  `run_analysis()`.
 - `run_analysis()` runs `SAFE_Use.RunAnalysis1`.
 - `write_reactions()` runs `SAFE_Use.WriteNodalReactions1`.
 - `get_utilization() -> list[list[float]]` reads one triple per pile (utilization
@@ -289,6 +308,57 @@ until the layout stops moving. It needs only numpy and scipy (Qhull through
 - `area_spread(polygon, sites)` returns the cell areas and their spread,
   `(max - min) / (polygon area / number of cells)`. `energy(polygon, sites)` returns
   the CVT energy, the sum over the cells of the integral of `|x - site|² dA`.
+
+## `weighted_cvt.py`
+
+The same polygon job as `lloyd_cvt.py`, but the cells are sized by weights instead of
+all being equal. Each site carries an additive Laguerre weight, so a cell is the set of
+points with the smallest `|x - site|² - weight`; the weights are solved so the areas
+come out in the requested ratio, and every site is relaxed onto its own cell's centroid.
+It imports the geometry primitives from `lloyd_cvt.py`, leaves that file alone, and
+needs only numpy and scipy.
+
+"Weight" means two different things here, so the code keeps them apart. The caller
+passes an **area weight** per site, a target, and the realised `areas` are proportional
+to it. The **Laguerre weights** that produce those areas are solved internally and come
+back in `WeightedCVT.weights`; they are monotone in the requested ratio but not
+proportional to it.
+
+- `weighted_cvt(polygon, area_weights, *, seed=None, tol=1e-9, area_tol=1e-3,
+  max_iter=200, weight_iter=50, damping=0.5, neighbour_mode="auto")` returns a
+  `WeightedCVT`. The polygon must be convex and `area_weights` holds one positive weight
+  per site, so its length is the number of sites. Cell `i` is driven towards
+  `polygon area * area_weights[i] / sum(area_weights)`. The deterministic equal-area CVT
+  is the start unless `seed` is an int.
+- `WeightedCVT` is a `NamedTuple` of `sites`, `weights`, `areas`, `targets`,
+  `iterations`, `max_area_error` and `converged`. The four lists are parallel and sorted
+  by descending y and then ascending x, and `max_area_error` is
+  `max |areas - targets| / total area`.
+- `best_weighted_cvt(polygon, area_weights, k=8, *, criterion="area_error", ...)` runs
+  the deterministic start plus `k` seeded starts and keeps the best by `criterion`,
+  either `"area_error"` or `"centroid"`.
+- `power_cells(polygon, sites, weights=None)` returns each site's power cell as a
+  polygon (`weights=None` gives plain Voronoi), `cell_areas` returns just the areas, and
+  `validate_weighted(polygon, sites, weights, area_weights, tol=1e-3, area_tol=1e-2)`
+  lists what is wrong with a weighted tessellation, and an empty list means it is fine.
+
+Neighbours come from the regular (weighted Delaunay) triangulation, the lower hull of
+the sites lifted onto `z = |x|² - weight`, falling back to clipping against every site if
+that fails. A site with no triangulation edge is dominated, and its cell is empty rather
+than the whole polygon. Damped Newton solves the weights on the areas, with Levenberg
+damping that lets a squeezed-out cell grow back. Sites move only `damping` of the way to
+their centroid each step, because a full move makes the weight solve and the site move
+fight until cells collapse. `converged` reports whether the areas reached `area_tol`;
+when it is false the result still comes back, with `max_area_error` recording how far off
+it got.
+
+`tests/test_weighted_cvt.py` covers it: `python tests/test_weighted_cvt.py` or pytest.
+`tests/test_against_voronoip.py` cross-checks the cells against the third-party
+`voronoip` library, which is optional and skipped when absent. That library's
+`Voronoi(mode="power", radii=…)` and `PowerVoronoi` use `|x - c|² - w²`, so its weights
+are this module's Laguerre weights under a square root; the cell areas agree to about
+`1e-15` and the empty cells agree exactly. Its `PowerDiagram` class uses the mirrored
+`|x - c|² + w²` convention, where a bigger weight gives a smaller cell.
 
 ## `rename_repo.bat`
 
