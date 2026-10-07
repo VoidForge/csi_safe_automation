@@ -17,6 +17,8 @@ reference material they run against stay out of this repository.
 | `SAFE_Use.bas` | Companion, site-specific subs that call into the library. |
 | `Interpolation2D.bas` | Standalone module: linear interpolation on scattered 2-D points. Calls nothing outside itself. |
 | `auto_analysis.py` | Python (xlwings) driver that runs the workbook's own macros in sequence and records the results. |
+| `record_store.py` | Python: reads, checks and appends the run-records CSV, and holds the recorded trials in memory. |
+| `trivial_optimizer.py` | Python: greedy hill-climb on the pile layout, one pile and one step per iteration, scoring each trial with the workbook's own SAFE analysis. |
 | `lloyd_cvt.py` | Python: centroidal Voronoi tessellation of a convex polygon by Lloyd's algorithm. |
 | `weighted_cvt.py` | Python: power-diagram (Laguerre) tessellation of a convex polygon whose cell areas follow per-site weights. |
 | `rename_repo.bat` | Repairs the `origin` remote URL after the GitHub repository was renamed. |
@@ -252,11 +254,11 @@ write_coords(coords)  ->  run_analysis()  ->  write_reactions()  ->  get_utiliza
 - `get_utilization() -> list[list[float]]` reads one triple per pile (utilization
   without wind, utilization with wind, tension surplus) for the rows written by the last
   `write_coords` call. A blank or non-numeric cell raises.
-- `write_test_record() -> list[float]` appends the workbook's current pile values as a
-  new row at the bottom of the run-records CSV, one row per record, after checking them
-  against the CSV's own header: the number of values has to match the column count, and
-  each pile prefix has to line up with its columns, so a misaligned row is refused. It
-  returns the row it appended.
+- `write_test_record() -> list[record_store.PileRecord]` appends the workbook's current pile
+  values as a new row at the bottom of the run-records CSV, one row per record. `record_store`
+  writes it and checks the row against the CSV's own header first: the number of values has to
+  match the column count, and each pile prefix has to line up with its columns. It returns the
+  row it appended, one `(name, x, y, util_nw, util_w, tension)` tuple per pile.
 - `print_vba_log() -> str` prints the library's shared log (`SAFE_Library.GetLog`) to
   stdout and returns it. It only reads, and never clears the log.
 

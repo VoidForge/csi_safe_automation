@@ -12,13 +12,15 @@ can stand in for the write_coords() call.
 get_utilization() hands the results back; write_test_record() appends them to the
 records CSV; print_vba_log() prints the workbook's own log.
 
+The records CSV belongs to record_store.py, which reads, checks and appends it. This
+module reads the sheet and hands the row over.
+
 The workbook name is a module constant; the worksheet, cells and macro names are
 hardcoded at the top of each function.
 """
 
 from __future__ import annotations
 
-import csv
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -27,10 +29,13 @@ from typing import Any, Iterator, Sequence
 
 import xlwings as xw
 
+from record_store import PileRecord, RecordStore
+
 WORKBOOK = "Auto Piling v20260916-0421.xlsm"    # must already be open in Excel
 
 RECORDS_CSV = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"
-                                # appended to by write_test_record(), one row per record
+                                # the workbook's run-records log; read and appended
+                                # through record_store, one row per record
 
 _wb: xw.Book | None = None      # workbook found on the first call, kept for the session
 _n_coords = 0                   # rows written by the last write_coords() call
@@ -346,105 +351,18 @@ def read_pile_values() -> tuple[list[str], list[float]]:
     return prefixes, values
 
 
-def append_test_record(values: list[float], prefixes: list[str] | None = None,
-                       path: Path | str | None = None) -> list[float]:
-    """Append one flat row of `values` to the BOTTOM of a records CSV.
-
-    `values` is the CSV-ordered row that read_pile_values() returns (five numbers
-    per pile); `path` is the CSV to append to and defaults to the workbook's own
-    data/SWTKT_test_records.csv. The row is checked against that file's own header
-    first: the number of values has to match the column count and, when
-    `prefixes` is given, each pile prefix has to line up with its columns, so a
-    misaligned row is refused rather than appended. Returns the row it appended.
-    """
-    PER_PILE = 5                                     # x, y, util_nw, util_w, tension
-
-    csv_path = RECORDS_CSV if path is None else Path(path)
-    text = csv_path.read_text(encoding="utf-8")
-    header = next(csv.reader(text.splitlines()), None)
-    if header is None:
-        raise RuntimeError(f"'{csv_path}' has no header row to line up with")
-    if len(values) != len(header):
-        raise ValueError(
-            f"{len(values)} value(s) to append but '{csv_path.name}' has "
-            f"{len(header)} column(s) - refusing to append a misaligned row"
-        )
-    if prefixes is not None:
-        for i, prefix in enumerate(prefixes):
-            if not header[PER_PILE * i].startswith(prefix):
-                raise ValueError(
-                    f"pile {i + 1} is '{prefix}' but column "
-                    f"{PER_PILE * i + 1} of '{csv_path.name}' is "
-                    f"'{header[PER_PILE * i]}' - refusing to append a misaligned row"
-                )
-
-    with open(csv_path, "a", newline="", encoding="utf-8") as csv_file:
-        if text and not text.endswith("\n"):          # never glue onto the last row
-            csv_file.write("\n")
-        csv.writer(csv_file).writerow(values)
-    return values
-
-
-def write_test_record() -> list[float]:
+def write_test_record() -> list[PileRecord]:
     """Append the workbook's current pile values as a new row in the records CSV.
 
     Reads 'Pile Coords' (A = pile prefix, B:C = x and y, H:J = utilization w/o
-    wind, utilization w/ wind and tension surplus) and appends the values to the
-    BOTTOM of data/SWTKT_test_records.csv - five per pile, in the CSV's own column
-    order, which the header is checked against first. Returns the row appended.
+    wind, utilization w/ wind and tension surplus) and appends the values, five per
+    pile in the CSV's own column order, to the BOTTOM of data/SWTKT_test_records.csv.
+    record_store writes the row, after checking it against the file's own header.
+    Returns the row appended, one (name, x, y, util_nw, util_w, tension) tuple per
+    pile.
     """
     prefixes, values = read_pile_values()
-    return append_test_record(values, prefixes)
-
-
-PileRecord = tuple[str, float, float, float, float, float]
-                                # (pile name, x, y, util_nw, util_w, tension)
-
-
-def read_test_records(path: Path | str | None = None) -> list[list[PileRecord]]:
-    """Read the records CSV back as one tuple per pile per row.
-
-    Returns one list per DATA row (header excluded, blank lines skipped), each
-    holding one tuple per pile in the CSV's column order:
-    (pile name, x, y, util_nw, util_w, tension) - the name being the column key
-    before '~' ('BP01~x' -> 'BP01'). Defaults to data/SWTKT_test_records.csv;
-    a header-only file gives []; values arrive as floats, never as strings.
-    """
-    PER_PILE = 5                                     # x, y, util_nw, util_w, tension
-
-    csv_path = RECORDS_CSV if path is None else Path(path)
-    with open(csv_path, newline="", encoding="utf-8") as csv_file:
-        rows = list(csv.reader(csv_file))
-    if not rows:
-        raise RuntimeError(f"'{csv_path}' is empty - it has no header row")
-
-    header = rows[0]
-    if len(header) % PER_PILE:
-        raise ValueError(
-            f"'{csv_path.name}' has {len(header)} column(s), which is not a "
-            f"multiple of {PER_PILE}"
-        )
-    names = [header[g * PER_PILE].split("~")[0] for g in range(len(header) // PER_PILE)]
-
-    out: list[list[PileRecord]] = []
-    for line, cells in enumerate(rows[1:], start=2):  # the header is line 1
-        if not cells:
-            continue                                 # blank line - nothing to read
-        if len(cells) != len(header):
-            raise ValueError(
-                f"line {line} of '{csv_path.name}' has {len(cells)} column(s) but "
-                f"the header has {len(header)}"
-            )
-        piles: list[PileRecord] = []
-        for g, name in enumerate(names):
-            first = g * PER_PILE
-            values = [_number(cells[first + k],
-                              f"{csv_path.name} line {line} column {first + k + 1}")
-                      for k in range(PER_PILE)]
-            x, y, util_nw, util_w, tension = values
-            piles.append((name, x, y, util_nw, util_w, tension))
-        out.append(piles)
-    return out
+    return RecordStore.load(RECORDS_CSV).append(values, prefixes=prefixes)
 
 
 def print_vba_log() -> str:
