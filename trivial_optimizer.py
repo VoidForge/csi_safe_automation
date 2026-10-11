@@ -1,13 +1,13 @@
 """Greedy pile-layout optimizer for the Auto Piling workbook.
 
-Every iteration moves ONE pile and keeps the best of eight trial moves:
+Every iteration moves one pile and keeps the best of eight trial moves:
 
   1. Pick the pile with the highest governing utilization, where a pile's
      governing utilization is the worse of its two cases:
      ``max(utilization without wind, utilization with wind)``.
   2. Move that pile by ``STEP_SIZE`` in each of the eight compass directions. A
      candidate whose exact coordinates are already in the record store is
-     skipped - its result is known, so no analysis runs and no row is appended.
+     skipped: its result is known, so no analysis runs and no row is appended.
      Every other candidate is analysed and its row is appended to `RECORDS_CSV`
      immediately (`record_store.RecordStore`), so an interrupted run keeps every
      trial it had reached.
@@ -15,20 +15,20 @@ Every iteration moves ONE pile and keeps the best of eight trial moves:
      as it is recorded, and the next baseline is its best row (lowest highest
      utilization). Nothing is re-read from disk during a run.
   4. If that best row is no better than the baseline the iteration started from,
-     raise `NoImprovementError` - the layout is a local optimum at this step
+     raise `NoImprovementError`: the layout is a local optimum at this step
      size. That is also what an iteration whose candidates were all tried before
      reports.
 
 The pile count and pile order come from the records CSV header, so nothing here
 assumes 22 piles. All model-specific knowledge is confined to the "model glue"
-block below - `RECORDS_CSV`, `STEP_SIZE`, `DIRECTIONS` and `evaluate` - so
+block below (`RECORDS_CSV`, `STEP_SIZE`, `DIRECTIONS` and `evaluate`), so
 swapping that block is all it takes to point the optimizer at another model.
 
 `record_store.py` holds the recorded rows, the readings taken from them and the
 `RecordStore` itself. The `RECORDS_CSV` below is the path this module gives it.
 
 A recorded row is only valid for the model it was measured against, so a model
-edit or a changed STEP_SIZE makes older rows stale - they can be both the
+edit or a changed STEP_SIZE makes older rows stale. They can be both the
 baseline and the thing that marks a candidate "already tried".
 
 Requirements: the workbook must already be open in Excel and SAFE must be
@@ -47,7 +47,7 @@ from record_store import (RecordStore, record_coords, record_max_util,
                           record_utilization)
 
 # ---------------------------------------------------------------------------
-# model glue - the only part that knows about the Auto Piling model.
+# model glue: the only part that knows about the Auto Piling model.
 # ---------------------------------------------------------------------------
 RECORDS_CSV: Path = aa.RECORDS_CSV              # run-records log: read back, appended to
 
@@ -68,7 +68,7 @@ DIRECTIONS: tuple[tuple[int, int], ...] = (     # eight compass directions
 def evaluate(coords: list[list[float]]) -> list[float]:
     """Push `coords` into the model, analyse it, and record the trial.
 
-    Returns the flat row just appended to `RECORDS_CSV` - five numbers per pile,
+    Returns the flat row just appended to `RECORDS_CSV`: five numbers per pile,
     in the CSV's own order. The utilization comes from that row instead of a
     second sheet read, so a trial costs one Excel read. The caller puts the row
     into the `RecordStore`.
@@ -93,7 +93,7 @@ def governing(utilization: list[list[float]]) -> list[float]:
 
 
 def peak(utilization: list[list[float]]) -> float:
-    """Highest governing utilization across every pile - the objective."""
+    """Highest governing utilization across every pile: the objective."""
     return max(governing(utilization))
 
 
@@ -110,7 +110,9 @@ class NoImprovementError(RuntimeError):
     """None of the eight trials beat the best layout the records CSV held.
 
     Carries the best state found (``coords``, ``utilization``, ``pile_index``,
-    ``iterations``) so the caller can carry on from it.
+    ``iterations``) so the caller can carry on from it, and ``best_trial_peak``:
+    the lowest highest-utilization that iteration's trials reached, which is the
+    baseline's own value when the iteration ran no trial at all.
     """
 
     def __init__(self, pile_index: int, coords: list[list[float]],
@@ -144,7 +146,8 @@ def optimize(*,
     Starts from the store's best row and works from the store throughout, so a
     layout that has already been analysed is never analysed again. Returns the
     best ``(coords, utilization, iterations)``; raises `NoImprovementError` when
-    the iteration's candidates all fail to beat the baseline.
+    the iteration's candidates all fail to beat the baseline, carrying the best
+    result those candidates reached.
     """
     if store is None:
         store = RecordStore.load(RECORDS_CSV)
@@ -160,21 +163,27 @@ def optimize(*,
         log(f"iteration {iterations + 1}: baseline highest utilization "
             f"{current_peak:.6g}, pile {pile_index + 1} is the worst")
 
+        best_trial_peak: float | None = None     # best result any trial of this iteration reached
         for direction in directions:
             trial_coords = move_pile(coords, pile_index, direction, step_size)
-            known = store.find(trial_coords)
-            if known is not None:
+            trial = store.find(trial_coords)
+            if trial is not None:
                 log(f"  {direction}: already tried (highest utilization "
-                    f"{record_max_util(known):.6g}) - skipped")
-                continue
-            record = store.add(evaluate_fn(trial_coords))
-            log(f"  {direction}: highest utilization {record_max_util(record):.6g}")
+                    f"{record_max_util(trial):.6g}), skipped")
+            else:
+                trial = store.add(evaluate_fn(trial_coords))
+                log(f"  {direction}: highest utilization {record_max_util(trial):.6g}")
+            trial_peak = record_max_util(trial)
+            if best_trial_peak is None or trial_peak < best_trial_peak:
+                best_trial_peak = trial_peak
 
         accepted = store.best()                          # the store is the memory
         if record_max_util(accepted) >= current_peak:
-            raise NoImprovementError(pile_index, record_coords(accepted),
-                                     record_utilization(accepted), iterations,
-                                     record_max_util(accepted))
+            raise NoImprovementError(
+                pile_index, record_coords(accepted), record_utilization(accepted),
+                iterations,
+                current_peak if best_trial_peak is None else best_trial_peak,
+            )
         iterations += 1
         log(f"  accepted the best of the eight -> highest utilization "
             f"{record_max_util(accepted):.6g}")

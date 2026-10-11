@@ -9,9 +9,9 @@ reads the sheet and hands the flat row here.
 The readings the optimizer takes from a row are here too: `record_coords`,
 `record_utilization`, `record_peak` and `best_record`.
 
-A store is always given the CSV path, so the file rows were read from and the file
-new rows are appended to cannot drift apart. Nothing here has a default path: the
-caller's model glue (for `trivial_optimizer.py`, its `RECORDS_CSV`) decides.
+A store is always given the CSV path, so the file its rows came from and the file it
+appends to cannot drift apart. Nothing here has a default path: the caller's model
+glue (for `trivial_optimizer.py`, its `RECORDS_CSV`) decides.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def _row(values: Sequence[float], names: Sequence[str]) -> list[PileRecord]:
     if len(values) != CSV_FIELDS_PER_PILE * len(names):
         raise ValueError(
             f"{len(values)} recorded value(s) but {len(names)} pile(s) of "
-            f"{CSV_FIELDS_PER_PILE} values were expected - refusing a misaligned "
+            f"{CSV_FIELDS_PER_PILE} values were expected; refusing a misaligned "
             "row"
         )
     row: list[PileRecord] = []
@@ -109,7 +109,7 @@ def _read(path: Path) -> tuple[list[str], list[list[PileRecord]]]:
     with open(path, newline="", encoding="utf-8") as csv_file:
         rows = list(csv.reader(csv_file))
     if not rows:
-        raise RuntimeError(f"'{path}' is empty - it has no header row")
+        raise RuntimeError(f"'{path}' is empty; it has no header row")
 
     header = rows[0]
     if len(header) % CSV_FIELDS_PER_PILE:
@@ -146,10 +146,10 @@ def _write_row(values: Sequence[float], path: Path, *,
     """Check a flat row against `path`'s own header, then append it at the bottom.
 
     The row has to match the file's column count and, when `prefixes` is given,
-    every pile prefix has to line up with its columns. Anything else raises
-    ValueError without touching the file. `expect_header` is the header the caller
-    believes the file carries, and a file that no longer matches it raises too. The
-    appended row comes back parsed.
+    there has to be exactly one prefix per pile and each has to equal the pile name
+    of that group of columns. Anything else raises ValueError without touching the
+    file. `expect_header` is the header the caller believes the file carries, and a
+    file that no longer matches it raises too. The appended row comes back parsed.
     """
     text = path.read_text(encoding="utf-8")
     header = next(csv.reader(text.splitlines()), None)
@@ -157,21 +157,28 @@ def _write_row(values: Sequence[float], path: Path, *,
         raise RuntimeError(f"'{path}' has no header row to line up with")
     if expect_header is not None and header != list(expect_header):
         raise ValueError(
-            f"'{path.name}' no longer has the header this store was loaded with - "
+            f"'{path.name}' no longer has the header this store was loaded with; "
             "refusing to append a row that would not line up"
         )
     if len(values) != len(header):
         raise ValueError(
             f"{len(values)} value(s) to append but '{path.name}' has "
-            f"{len(header)} column(s) - refusing to append a misaligned row"
+            f"{len(header)} column(s). Refusing to append a misaligned row"
         )
+    names = _names(header)
     if prefixes is not None:
+        if len(prefixes) != len(names):
+            raise ValueError(
+                f"{len(prefixes)} pile prefix(es) for {len(names)} pile(s) of "
+                f"{CSV_FIELDS_PER_PILE} column(s) in '{path.name}'. Refusing to "
+                "check a row against only part of its columns"
+            )
         for i, prefix in enumerate(prefixes):
-            if not header[CSV_FIELDS_PER_PILE * i].startswith(prefix):
+            if names[i] != prefix:
                 raise ValueError(
                     f"pile {i + 1} is '{prefix}' but column "
                     f"{CSV_FIELDS_PER_PILE * i + 1} of '{path.name}' is "
-                    f"'{header[CSV_FIELDS_PER_PILE * i]}' - refusing to append a "
+                    f"'{header[CSV_FIELDS_PER_PILE * i]}'. Refusing to append a "
                     "misaligned row"
                 )
 
@@ -179,7 +186,7 @@ def _write_row(values: Sequence[float], path: Path, *,
         if text and not text.endswith("\n"):         # never glue onto the last row
             csv_file.write("\n")
         csv.writer(csv_file).writerow(values)
-    return _row(values, _names(header))
+    return _row(values, names)
 
 
 class RecordStore:
@@ -210,7 +217,7 @@ class RecordStore:
         else:
             raise ValueError(
                 "a store built from rows needs at least one row to take the pile "
-                "names from - pass header= for a file that is only a header"
+                "names from. Pass header= for a file that is only a header"
             )
         self.names: list[str] = names
 
@@ -221,7 +228,7 @@ class RecordStore:
             if len(row) != len(self.names):
                 raise ValueError(
                     f"a recorded row holds {len(row)} pile(s) but the first one "
-                    f"holds {len(self.names)} - refusing to index them together"
+                    f"holds {len(self.names)}. Refusing to index them together"
                 )
             if self._index_row(row):
                 repeats.add(key_of(record_coords(row)))
@@ -244,7 +251,7 @@ class RecordStore:
         """The recorded row with the lowest highest-utilization (ties: earliest)."""
         if not self.rows:
             raise RuntimeError(
-                "no recorded trial to work from - the records CSV needs at least "
+                "no recorded trial to work from; the records CSV needs at least "
                 "one row before the optimizer can start"
             )
         return best_record(self.rows)
@@ -266,14 +273,15 @@ class RecordStore:
         """Append a trial to this store's CSV and to memory, in one call.
 
         The row has to match the file's own header (its column count and, when
-        `prefixes` is given, every pile prefix) and the header this store was loaded
-        with, so a CSV edited since then raises ValueError before anything is
-        written. Returns the row as it is held in memory now.
+        `prefixes` is given, one prefix per pile, each equal to that group's pile
+        name) and the header this store was loaded with, so a CSV edited since then
+        raises ValueError before anything is written. Returns the row as it is held
+        in memory now.
         """
         if self.path is None:
             raise RuntimeError(
                 "this store was built from rows, not from a CSV, so it has no "
-                "file to append to - build it with RecordStore.load(path)"
+                "file to append to. Build it with RecordStore.load(path)"
             )
         row = _write_row(values, self.path, prefixes=prefixes,
                          expect_header=self._header)

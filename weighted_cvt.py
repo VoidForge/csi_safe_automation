@@ -355,6 +355,11 @@ def best_weighted_cvt(
 ) -> WeightedCVT:
     """Run the deterministic start plus `k` seeded starts and keep the best result.
 
+    `k + 1` starts always run, the deterministic one first: with `seed=None` they are
+    that start followed by seeds `0 … k-1`, and with an integer `seed` they are the
+    deterministic start, that seed, then further seeds from `range(k)` until `k`
+    seeded starts have run.
+
     `criterion` is "area_error" (smallest `max_area_error`, default) or "centroid"
     (smallest worst |site - cell centroid| relative to the diagonal).
     """
@@ -363,14 +368,14 @@ def best_weighted_cvt(
     if criterion not in ("area_error", "centroid"):
         raise ValueError("criterion must be 'area_error' or 'centroid'")
     poly, _ = _ring(polygon)
-    seeds: list[int | None] = [seed]
     if seed is None:
-        seeds.extend(range(k))
+        starts: list[int | None] = [None, *range(k)]
     else:
-        seeds.extend(s for s in range(k) if s != seed)
+        others = [s for s in range(k) if s != seed][: k - 1]
+        starts = [None, seed, *others]
     best: WeightedCVT | None = None
     best_score = np.inf
-    for start in seeds:
+    for start in starts:
         result = weighted_cvt(
             polygon,
             area_weights,
@@ -388,7 +393,7 @@ def best_weighted_cvt(
         )
         if score < best_score:
             best, best_score = result, score
-    assert best is not None  # seeds is never empty, so the loop always assigns
+    assert best is not None  # starts is never empty, so the loop always assigns
     return best
 
 

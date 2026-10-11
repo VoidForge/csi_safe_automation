@@ -1,7 +1,7 @@
 """xlwings driver for the Auto Piling workbook.
 
 Runs the workbook's own SAFE macros (module SAFE_Use, which needs SAFE_Library)
-through xlwings, so the workbook must ALREADY be open in Excel and SAFE must be
+through xlwings, so the workbook must already be open in Excel and SAFE must be
 running with the model loaded. Intended order of calls:
 
     write_coords(coords)  ->  run_analysis()  ->  write_reactions()  ->  get_utilization()
@@ -74,7 +74,7 @@ def _ole(label: str) -> Iterator[None]:
 # workbook / macro plumbing
 # ---------------------------------------------------------------------------
 def _book(workbook: str) -> xw.Book:
-    """Return the ALREADY OPEN workbook called `workbook` (cached)."""
+    """Return the already open workbook called `workbook` (cached)."""
     global _wb
     if _wb is not None:
         try:
@@ -88,7 +88,7 @@ def _book(workbook: str) -> xw.Book:
             apps = list(xw.apps)
         except Exception as exc:
             raise RuntimeError(
-                "no running Excel instance found - open the workbook first"
+                "no running Excel instance found. Open the workbook first"
             ) from exc
 
         for app in apps:
@@ -97,7 +97,7 @@ def _book(workbook: str) -> xw.Book:
                     _wb = book
                     return _wb
         raise RuntimeError(
-            f"workbook '{workbook}' is not open in Excel - open it and call again"
+            f"workbook '{workbook}' is not open in Excel. Open it and call again"
         )
 
 
@@ -157,7 +157,7 @@ def _pile_prefixes(sheet: xw.Sheet, first_row: int) -> list[str]:
     prefixes = ["" if p is None else str(p).strip() for p in raw]
     if not prefixes or not all(prefixes):
         raise RuntimeError(
-            f"no pile prefixes found in '{sheet.name}'!A{first_row} downwards - the "
+            f"no pile prefixes found in '{sheet.name}'!A{first_row} downwards. The "
             "coordinate table is expected in A (prefix), B (x), C (y)"
         )
     return prefixes
@@ -190,7 +190,7 @@ def write_coords(coords: list[list[float]]) -> None:
 
     global _n_coords
     if not coords:
-        raise ValueError("coords is empty - nothing to write")
+        raise ValueError("coords is empty, nothing to write")
 
     rows = []
     for i, pair in enumerate(coords, start=1):
@@ -257,7 +257,7 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
     if n != len(prefixes):
         raise ValueError(
             f"the layout holds {n} pile(s) but '{SHEET}'!A{FIRST_ROW} holds "
-            f"{len(prefixes)} prefix(es) - refusing to write a layout that does not "
+            f"{len(prefixes)} prefix(es). Refusing to write a layout that does not "
             "line up with the sheet"
         )
     if area_weights is None:
@@ -274,7 +274,7 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
         raise RuntimeError(
             f"the layout did not reach the requested areas: the worst cell misses its "
             f"target by {result.max_area_error:.3g} of the cap area after "
-            f"{result.iterations} iteration(s) (area_tol={area_tol:g}) - nothing was "
+            f"{result.iterations} iteration(s) (area_tol={area_tol:g}). Nothing was "
             "written. Loosen area_tol, raise best_of, or pass allow_nonconverged=True."
         )
 
@@ -313,7 +313,7 @@ def get_utilization() -> list[list[float]]:
     if _n_coords <= 0:
         raise RuntimeError(
             "write_coords() has not run yet, so the number of utilization rows is "
-            "unknown - call write_coords() first"
+            "unknown. Call write_coords() first"
         )
 
     return _utilization(_book(WORKBOOK), SHEET, _n_coords)
@@ -324,7 +324,7 @@ def read_pile_values() -> tuple[list[str], list[float]]:
 
     One round trip for the whole table: the prefix column A downwards, the x and
     y in B:C, and the utilization w/o wind, utilization w/ wind and tension
-    surplus in H:J - five numbers per pile, in the records CSV's own column
+    surplus in H:J, five numbers per pile, in the records CSV's own column
     order. Nothing is written anywhere and no CSV is touched.
     """
     SHEET = "Pile Coords"
@@ -356,7 +356,7 @@ def write_test_record() -> list[PileRecord]:
 
     Reads 'Pile Coords' (A = pile prefix, B:C = x and y, H:J = utilization w/o
     wind, utilization w/ wind and tension surplus) and appends the values, five per
-    pile in the CSV's own column order, to the BOTTOM of data/SWTKT_test_records.csv.
+    pile in the CSV's own column order, to the bottom of data/SWTKT_test_records.csv.
     record_store writes the row, after checking it against the file's own header.
     Returns the row appended, one (name, x, y, util_nw, util_w, tension) tuple per
     pile.
@@ -369,7 +369,7 @@ def print_vba_log() -> str:
     """Print the workbook's shared VBA log (SAFE_Library) to stdout; return it too.
 
     The SAFE_Use subs report failures by logging instead of raising, so a macro
-    that ran but did nothing is only visible here. Read-only - it never clears.
+    that ran but did nothing is only visible here. Read-only: it never clears.
     """
     MACRO = "SAFE_Library.GetLog"                    # returns the whole log as one string
 
@@ -397,8 +397,8 @@ def quiet_excel() -> Iterator[None]:
     and while it is parked any message its window receives makes it put up
     "Microsoft Excel is waiting for another application to complete an OLE
     action". Dropping repaint and alert traffic removes most of the messages
-    that trigger it. Only these two settings are touched - events, calculation
-    mode and the model are left alone - and the values found on entry are put
+    that trigger it. Only these two settings are touched: events, calculation
+    mode and the model are left alone. The values found on entry are put
     back on every exit path, so a failure inside the block cannot leave Excel
     stuck looking frozen.
     """
