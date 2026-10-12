@@ -254,11 +254,6 @@ write_coords(coords)  ->  run_analysis()  ->  write_reactions()  ->  get_utiliza
 - `get_utilization() -> list[list[float]]` reads one triple per pile (utilization
   without wind, utilization with wind, tension surplus) for the rows written by the last
   `write_coords` call. A blank or non-numeric cell raises.
-- `write_test_record() -> list[record_store.PileRecord]` appends the workbook's current pile
-  values as a new row at the bottom of the run-records CSV, one row per record. `record_store`
-  writes it and checks the row against the CSV's own header first: the number of values has to
-  match the column count, and each pile prefix has to line up with its columns. It returns the
-  row it appended, one `(name, x, y, util_nw, util_w, tension)` tuple per pile.
 - `print_vba_log() -> str` prints the library's shared log (`SAFE_Library.GetLog`) to
   stdout and returns it. It only reads, and never clears the log.
 

@@ -108,11 +108,11 @@ affected work package before continuing.
 
 | File | Lines | Boundary status |
 | ---- | ----: | --------------- |
-| `auto_analysis.py` | 415 | Excel + Excel→SAFE macros + model sheets, all in one module |
+| `auto_analysis.py` | 394 | Excel + Excel→SAFE macros + model sheets, all in one module |
 | `SAFE_Library.bas` | 2,923 | SAFE API + the generic Excel table writer, mixed |
 | `SAFE_Use.bas` | 1,513 | model workflows + Excel range reads/writes, mixed |
 | `Interpolation2D.bas` | 1,397 | out of scope |
-| `trivial_optimizer.py` | 216 | algorithm is clean; `import auto_analysis as aa` at line 45 pulls in xlwings |
+| `trivial_optimizer.py` | 233 | algorithm is clean; `import auto_analysis as aa` at line 45 pulls in xlwings |
 | `record_store.py` | 302 | clean (stdlib `csv` only) |
 | `lloyd_cvt.py` | 306 | clean (numpy) |
 | `weighted_cvt.py` | 482 | clean (numpy/scipy) |
@@ -123,38 +123,36 @@ affected work package before continuing.
 
 | Lines | Symbol | Category |
 | ----- | ------ | -------- |
-| 34 | `WORKBOOK` | Excel config |
-| 36 | `RECORDS_CSV` | model data path |
-| 40 | `_wb` | Excel session cache |
-| 41 | `_n_coords` | **hidden process state** coupling `write_coords` → `get_utilization` |
-| 47, 53 | `_stamp`, `_ole` | Excel/OLE call logging (generic) |
-| 76 | `_book` | Excel attach (generic) |
-| 104 | `_run_macro` | **Excel→SAFE bridge** (runs the workbook's VBA) |
-| 120, 135, 144 | `_number`, `_grid`, `_cell` | Excel value/shape helpers (generic) |
-| 149 | `_pile_prefixes` | model sheet contract (`Pile Coords`!A3 down) |
-| 166 | `_write_coords_range` | model sheet contract + Excel write |
-| 173 | `_utilization` | model sheet contract (`Pile Coords`!H:J) |
-| 185 | `write_coords` | model operation (write B3:C, then run `SAFE_Use.ApplyPileCoordinates1`) |
-| 208 | `init_pile_layout` | model operation (weighted CVT → sheet → SAFE) |
-| 295 | `run_analysis` | Excel→SAFE bridge (`SAFE_Use.RunAnalysis1`) |
-| 302 | `write_reactions` | Excel→SAFE bridge (`SAFE_Use.WriteNodalReactions1`) |
-| 309 | `get_utilization` | model read, gated by `_n_coords` |
-| 322 | `read_pile_values` | model read (A + B:C + H:J in one OLE block) |
-| 354 | `write_test_record` | model operation (read sheet → `record_store` append) |
-| 368 | `print_vba_log` | bridge to the VBA log (`SAFE_Library.GetLog`) |
-| 393 | `quiet_excel` | Excel quiet mode (generic) |
+| 31 | `WORKBOOK` | Excel config |
+| 33 | `_wb` | Excel session cache |
+| 34 | `_n_coords` | **hidden process state** coupling `write_coords` → `get_utilization` |
+| 40, 46 | `_stamp`, `_ole` | Excel/OLE call logging (generic) |
+| 69 | `_book` | Excel attach (generic) |
+| 97 | `_run_macro` | **Excel→SAFE bridge** (runs the workbook's VBA) |
+| 113, 128, 137 | `_number`, `_grid`, `_cell` | Excel value/shape helpers (generic) |
+| 142 | `_pile_prefixes` | model sheet contract (`Pile Coords`!A3 down) |
+| 159 | `_write_coords_range` | model sheet contract + Excel write |
+| 166 | `_utilization` | model sheet contract (`Pile Coords`!H:J) |
+| 178 | `write_coords` | model operation (write B3:C, then run `SAFE_Use.ApplyPileCoordinates1`) |
+| 201 | `init_pile_layout` | model operation (weighted CVT → sheet → SAFE) |
+| 288 | `run_analysis` | Excel→SAFE bridge (`SAFE_Use.RunAnalysis1`) |
+| 295 | `write_reactions` | Excel→SAFE bridge (`SAFE_Use.WriteNodalReactions1`) |
+| 302 | `get_utilization` | model read, gated by `_n_coords` |
+| 315 | `read_pile_values` | model read (A + B:C + H:J in one OLE block) |
+| 347 | `print_vba_log` | bridge to the VBA log (`SAFE_Library.GetLog`) |
+| 372 | `quiet_excel` | Excel quiet mode (generic) |
 
 ### 5.3 `trivial_optimizer.py` — the leak
 
 | Lines | Content | Category |
 | ----- | ------- | -------- |
 | 45 | `import auto_analysis as aa` | **the leak** — importing the algorithm requires xlwings |
-| 52 | `RECORDS_CSV: Path = aa.RECORDS_CSV` | model glue |
-| 54, 56 | `STEP_SIZE`, `DIRECTIONS` | algorithm parameters (already keyword arguments of `optimize`) |
-| 68 | `evaluate` | **model glue**: `aa.write_coords` → `aa.run_analysis` → `aa.write_reactions` → `aa.read_pile_values` → `RecordStore.load(RECORDS_CSV).append(...)` |
-| 90–133 | `governing`, `peak`, `move_pile`, `NoImprovementError` | clean algorithm |
-| 136 | `optimize(*, store, step_size, directions, evaluate_fn=evaluate, ...)` | clean, except the `evaluate_fn` default |
-| 195 | `main` | model glue (prints a summary from the store) |
+| 52 | `RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"` | model glue (the run-records log path) |
+| 55, 57 | `STEP_SIZE`, `DIRECTIONS` | algorithm parameters (already keyword arguments of `optimize`) |
+| 69 | `evaluate` | **model glue**: `aa.write_coords` → `aa.run_analysis` → `aa.write_reactions` → `aa.read_pile_values` → `RecordStore.load(RECORDS_CSV).append(...)` |
+| 91–134 | `governing`, `peak`, `move_pile`, `NoImprovementError` | clean algorithm |
+| 137 | `optimize(*, store, step_size, directions, evaluate_fn=evaluate, ...)` | clean, except the `evaluate_fn` default |
+| 196 | `main` | model glue (prints a summary from the store) |
 
 Its own docstring already claims "all model-specific knowledge is confined to
 the model glue block". After this refactor that claim becomes true of the
@@ -428,9 +426,8 @@ def apply_pile_coordinates(sheet_name: str = PILE_SHEET,
                            range_address: str = COORD_RANGE) -> int
 def read_pile_values() -> tuple[list[str], list[float]]
 def get_utilization() -> list[list[float]]
-def write_test_record() -> list[PileRecord]
 def init_pile_layout(polygon, weights=None, *, n_piles=None, seed=None, best_of=0,
-                     area_tol=1e-3, allow_nonconverged=False,
+                     area_tol=1e-3, margin=0.0, allow_nonconverged=False,
                      apply=True) -> list[list[float]]
 
 # SAFE work
@@ -569,7 +566,7 @@ work, no renaming of public functions other than the ones listed.
 **Steps.**
 
 1. Move `_stamp`, `_ole`, `_book`, `_number`, `_grid`, `_cell`, `quiet_excel`
-   (lines 47–147, 393–415) into `excel_io.py` as `stamp`, `ole`, `attach`,
+   (lines 40–140, 372–394) into `excel_io.py` as `stamp`, `ole`, `attach`,
    `number`, `grid`, `cell_address`, `quiet_excel`. Keep the exact log line
    format (`HH:MM:SS.mmm  OLE -> label` / `OLE <- label  (0.123s)` /
    `OLE !! label  (0.123s, RuntimeError)`) and the `flush=True` prints.
@@ -753,11 +750,11 @@ test.
 2. Move from `auto_analysis.py`, unchanged in behaviour:
    `_pile_prefixes` → `pile_prefixes()`, `_write_coords_range` →
    `write_coord_values()`, `_utilization` → `utilization_values()`,
-   `read_pile_values()`, `get_utilization()`, `write_test_record()`,
+   `read_pile_values()`, `get_utilization()`,
    `read_coord_table()` (from `SAFE_Use.bas` 1183, with its skip rules and log
    lines), `write_table_list()`.
 3. **Remove `_n_coords`.** `get_utilization()` derives the row count from the
-   sheet's own prefix block (the rule `write_test_record` already follows), so a
+   sheet's own prefix block (the rule `read_pile_values()` already follows), so a
    fresh process can call it. Consequence to state in the docstring: the count
    is no longer tied to the last `write_coords()` call in this process.
 4. **Do not publish a partial `write_coords`.** WP-4a ships only the private
@@ -860,8 +857,8 @@ intact (`auto_analysis.py` untouched until WP-6).
 
 **Steps.**
 
-1. Move `evaluate` (68) → `safe_use.evaluate_layout(coords, *, records_csv=RECORDS_CSV)`
-   and `main` (195) → `safe_use.optimize_layout()`, behaviour unchanged
+1. Move `evaluate` (69) → `safe_use.evaluate_layout(coords, *, records_csv=RECORDS_CSV)`
+   and `main` (196) → `safe_use.optimize_layout()`, behaviour unchanged
    (including `RecordStore.load(...).append(values, prefixes=prefixes)` and the
    summary line printed by `main`).
 2. In `trivial_optimizer.py`: delete `import auto_analysis as aa`,
@@ -1047,7 +1044,6 @@ Excel + SAFE + the model, owner-supervised, recorded in
 - [ ] `write_nodal_reactions`: 8 columns, flush at `B5`, `Fz == 0` (raw value) rows dropped, blank `Fz` kept, forces divided only when numeric.
 - [ ] `load_cases` three-state contract, combinations cleared for the read and restored on both paths.
 - [ ] `read_pile_values` returns `(prefixes, five numbers per pile)` in the records CSV's column order.
-- [ ] `write_test_record` appends at the bottom, checks the header, and returns parsed `PileRecord`s.
 - [ ] `init_pile_layout` keeps the lazy `weighted_cvt` import (no numpy at module import).
 
 ---
@@ -1165,14 +1161,14 @@ Line numbers are current as of 2026-10-11.
 | 1345 `ScaledBy`, 1378 `TextToNumber`, 1410 `StartsWith`, 1419 `NumToText`, 1425 `NumFromText`, 1432 `ToDouble`, 1444 `NearlyEqual`, 1455 `SafeText` | `safe_use` helpers |
 | 1465 `TableFieldUnits` | `safe_library.table_field_units` |
 | 113 `Say` | `safe_use.say` |
-| `auto_analysis.py` 47/53/76/120/135/144/393 | `excel_io` |
-| 149/166/173/185/309/322/354/208 | `safe_use` |
-| 104/295/302/368 | deleted (macro bridge) |
-| 41 `_n_coords` | deleted |
-| 34/36 `WORKBOOK`/`RECORDS_CSV` | `safe_use` settings block |
-| `trivial_optimizer.py` 68 `evaluate` | `safe_use.evaluate_layout` |
-| 195 `main` | `safe_use.optimize_layout` |
-| 52 `RECORDS_CSV` | stays on `trivial_optimizer` (settable) |
+| `auto_analysis.py` 40/46/69/113/128/137/372 | `excel_io` |
+| 142/159/166/178/302/315/347/201 | `safe_use` |
+| 97/288/295/347 | deleted (macro bridge) |
+| 34 `_n_coords` | deleted |
+| 31 `WORKBOOK` | `safe_use` settings block |
+| `trivial_optimizer.py` 69 `evaluate` | `safe_use.evaluate_layout` |
+| 196 `main` | `safe_use.optimize_layout` |
+| 52 `RECORDS_CSV` | stays on `trivial_optimizer` (the literal path, settable) |
 
 ## Appendix B — Model facts the port must respect
 

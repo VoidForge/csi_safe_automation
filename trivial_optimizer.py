@@ -49,7 +49,9 @@ from record_store import (RecordStore, record_coords, record_max_util,
 # ---------------------------------------------------------------------------
 # model glue: the only part that knows about the Auto Piling model.
 # ---------------------------------------------------------------------------
-RECORDS_CSV: Path = aa.RECORDS_CSV              # run-records log: read back, appended to
+# RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"
+RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records_2026-10-11_02.csv"
+                                # the run-records log: read back and appended to
 
 STEP_SIZE = 500.0                               # trial move distance, model units
 
@@ -194,14 +196,38 @@ def optimize(*,
 
 def main() -> None:
     """Optimize from the best layout the records CSV already holds."""
+    # ---- initial pile layout: the config init_pile_layout() reads ----------
+    CAP_POLYGON: list[list[float]] = [[0.0,0.0],[56600,0],[56600,101000],[0,101000]]         
+    # convex cap outline in (x, y) model
+    # units, counter-clockwise, M >= 3.
+    # Empty: no layout is generated
+    PILE_WEIGHTS = [6.25,	9,	10.89,	10.89,	9,	10.89,	9,	9,	9,	10.89,	10.89,	9,	9,	9,	9,	9,	6.25,	9,	6.25,	6.25,	6.25,	6.25]
+
+    # one target area weight per pile;
+    # None gives every pile the same area
+    N_PILES: int | None = None                  
+    # pile count; None takes the count from
+    # 'Pile Coords'!A, and either way it has
+    # to match that prefix column
+    MARGIN = 3500
+
+    # ---- write that layout into the sheet and into SAFE -------------------
+    init_coords: list[list[float]]  = aa.init_pile_layout(CAP_POLYGON, PILE_WEIGHTS, n_piles=N_PILES, seed=42, best_of=7, margin=MARGIN)
+    print(init_coords)
     store = RecordStore.load(RECORDS_CSV)
-    print(f"{RECORDS_CSV.name}: {len(store.names)} piles, {len(store)} recorded "
-          f"layout(s), {store.duplicate_keys} repeated, best highest utilization "
-          f"{record_max_util(store.best()):.6g}, step size {STEP_SIZE:g}")
 
     try:
-        with aa.quiet_excel():                       # fewer Excel messages: fewer OLE prompts
+        with aa.quiet_excel():
+            if not len(store):
+                print("records CSV is header-only: seeding the starting layout")
+                store.add(evaluate(init_coords))
+
+            print(f"{RECORDS_CSV.name}: {len(store.names)} piles, {len(store)} recorded "
+                f"layout(s), {store.duplicate_keys} repeated, best highest utilization "
+                f"{record_max_util(store.best()):.6g}, step size {STEP_SIZE:g}")
+
             coords, utilization, iterations = optimize(store=store)
+
     except NoImprovementError as exc:
         print(exc)
         print(f"stopped after {exc.iterations} accepted move(s) at highest "

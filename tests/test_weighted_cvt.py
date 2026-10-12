@@ -18,6 +18,7 @@ from weighted_cvt import (  # noqa: E402
     _power_cells,
     best_weighted_cvt,
     cell_areas,
+    inset_polygon,
     power_cells,
     validate_weighted,
     weighted_cvt,
@@ -34,6 +35,16 @@ def _raises(exc, fn, *args, **kwargs) -> None:
     except exc:
         return
     raise AssertionError(f"{getattr(fn, '__name__', fn)} did not raise {exc.__name__}")
+
+
+def _clearance(polygon: list[tuple[float, float]], sites) -> float:
+    """Smallest distance from any of `sites` to any edge line of the polygon."""
+    ring = np.asarray(_ring(polygon)[0])
+    pts = np.asarray(sites, dtype=float)
+    edge = np.roll(ring, -1, axis=0) - ring
+    rel = pts[:, None, :] - ring[None, :, :]
+    cross = edge[None, :, 0] * rel[:, :, 1] - edge[None, :, 1] * rel[:, :, 0]
+    return float((cross / np.hypot(edge[:, 0], edge[:, 1])).min())
 
 
 def test_equal_weights_are_equal_area() -> None:
@@ -147,6 +158,65 @@ def test_validate_weighted_flags_nudged_site() -> None:
     nudged = [list(site) for site in result.sites]
     nudged[0][0] += 0.1
     assert validate_weighted(polygon, nudged, result.weights, result.targets)
+
+
+def test_margin_keeps_sites_off_the_edges() -> None:
+    polygon = square(2.0)
+    margin = 0.25
+    for ratios in ([1.0] * 9, [0.2, 1.0, 4.0, 1.0, 1.0, 1.0, 3.0, 0.5, 2.0]):
+        result = weighted_cvt(polygon, ratios, margin=margin)
+        assert _clearance(polygon, result.sites) >= margin - 1e-9
+        assert abs(sum(result.areas) - 4.0) < 1e-9  # the cells still cover the square
+        bad = validate_weighted(
+            polygon, result.sites, result.weights, result.targets, margin=margin
+        )
+        # a site held at the margin is no longer its cell's centroid, so only that shows
+        assert all("centroid" in message for message in bad), bad
+
+
+def test_margin_holds_sites_exactly_at_the_limit() -> None:
+    polygon = square(2.0)
+    margin = 0.6
+    result = weighted_cvt(polygon, [1.0] * 9, margin=margin)
+    assert result.converged, result
+    # the constraint is active, not merely slack: 9 sites cannot all clear 0.6 freely
+    assert abs(_clearance(polygon, result.sites) - margin) <= 1e-9
+
+
+def test_best_weighted_cvt_passes_the_margin_on() -> None:
+    polygon = square(2.0)
+    margin = 0.3
+    result = best_weighted_cvt(polygon, [1.0, 1.0, 2.0, 2.0, 3.0, 3.0], k=2, margin=margin)
+    assert _clearance(polygon, result.sites) >= margin - 1e-9
+    assert all(
+        "centroid" in message
+        for message in validate_weighted(
+            polygon, result.sites, result.weights, result.targets, margin=margin
+        )
+    )
+
+
+def test_margin_zero_leaves_the_default_run_alone() -> None:
+    ratios = [1.0, 2.0, 3.0, 4.0]
+    assert weighted_cvt(square(), ratios, seed=1) == weighted_cvt(
+        square(), ratios, seed=1, margin=0.0
+    )
+
+
+def test_inset_polygon_offsets_every_edge() -> None:
+    ring = np.asarray(inset_polygon(square(2.0), 0.25))
+    expected = np.array([[0.25, 0.25], [1.75, 0.25], [1.75, 1.75], [0.25, 1.75]])
+    assert ring.shape == (4, 2)
+    assert np.allclose(np.sort(ring, axis=0), np.sort(expected, axis=0))
+    assert abs(float(_area(ring)) - 1.5**2) < 1e-12
+    assert inset_polygon(square(2.0), 0.0) == square(2.0)
+
+
+def test_bad_margin_raises() -> None:
+    for bad in (-0.1, float("nan"), 0.5, 1.0):  # 0.5 and 1.0 leave no area in a unit square
+        _raises(ValueError, weighted_cvt, square(), [1.0, 1.0], margin=bad)
+    _raises(ValueError, best_weighted_cvt, square(), [1.0, 1.0], k=2, margin=0.5)
+    _raises(ValueError, inset_polygon, square(), 0.5)
 
 
 def test_best_weighted_cvt_converges() -> None:

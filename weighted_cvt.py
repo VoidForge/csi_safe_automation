@@ -9,9 +9,13 @@ sum(area_weights)``. The Laguerre weights that realise it are solved internally 
 back in ``WeightedCVT.weights``; they follow the requested ratios monotonically, though
 they are not proportional to them.
 
+`weighted_cvt` takes a `margin` that holds every site at least that far from each edge,
+and `inset_polygon` returns the ring that does the same for the cells.
+
 Public interface: `weighted_cvt` to generate a layout, `best_weighted_cvt` to pick the
-best of several starts, and `power_cells` / `cell_areas` / `validate_weighted` to
-inspect one. numpy and scipy only; the geometry primitives come from `lloyd_cvt`.
+best of several starts, `inset_polygon` for the ring offset inward by a margin, and
+`power_cells` / `cell_areas` / `validate_weighted` to inspect one. numpy and scipy only;
+the geometry primitives come from `lloyd_cvt`.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ __all__ = [
     "WeightedCVT",
     "weighted_cvt",
     "best_weighted_cvt",
+    "inset_polygon",
     "power_cells",
     "cell_areas",
     "validate_weighted",
@@ -241,6 +246,56 @@ def _solve_weights(
     return lam, cells, areas
 
 
+def _inset_ring(poly: np.ndarray, margin: float) -> np.ndarray:
+    """`poly` with every edge pushed `margin` towards the inside, or a ValueError.
+
+    An edge line contributes the half-plane of points at least `margin` from it, so
+    clipping the ring with all of them in turn leaves exactly those points. A margin at
+    or above the polygon's inradius leaves nothing, which is what raises.
+    """
+    ring = poly
+    for k in range(len(poly)):
+        edge = poly[(k + 1) % len(poly)] - poly[k]
+        inward = np.array([-edge[1], edge[0]])  # interior side of the edge, length |edge|
+        s = margin * float(np.hypot(*edge)) - (ring - poly[k]) @ inward
+        ring = _clip(ring, s)
+        if len(ring) < 3:
+            break
+    if len(ring) < 3 or _area(ring) < 1e-12 * _area(poly):
+        raise ValueError(f"margin {margin:g} leaves no area inside the polygon")
+    return ring
+
+
+def _project_to_ring(ring: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Nearest point of the closed convex `ring` to every row of `pts`.
+
+    A row already in the ring comes back unchanged. The rest land on the closest edge
+    segment, which for a convex ring is the orthogonal projection onto it.
+    """
+    out = np.array(pts, dtype=float, copy=True)
+    outside = ~_inside(ring, out)
+    if not outside.any():
+        return out
+    p = out[outside]
+    q = p.copy()
+    best = np.full(len(p), np.inf)
+    for k in range(len(ring)):
+        corner = ring[k]
+        edge = ring[(k + 1) % len(ring)] - corner
+        length2 = float(edge @ edge)
+        if length2 <= 0.0:  # a repeated vertex contributes its point only
+            foot = np.repeat(corner[None, :], len(p), axis=0)
+        else:
+            t = np.clip(((p - corner) @ edge) / length2, 0.0, 1.0)
+            foot = corner + t[:, None] * edge
+        d = ((foot - p) ** 2).sum(axis=1)
+        hit = d < best
+        best[hit] = d[hit]
+        q[hit] = foot[hit]
+    out[outside] = q
+    return out
+
+
 def _centroid_error(poly: np.ndarray, sites: np.ndarray, lam: np.ndarray) -> float:
     """Worst |site - own cell centroid| as a fraction of the polygon's diagonal."""
     diag = float(np.hypot(*np.ptp(poly, axis=0)))
@@ -256,6 +311,25 @@ def _centroid_error(poly: np.ndarray, sites: np.ndarray, lam: np.ndarray) -> flo
     return worst / diag
 
 
+def inset_polygon(polygon: Points, margin: float) -> list[tuple[float, float]]:
+    """`polygon` offset inward by `margin`, as a counter-clockwise ring of (x, y).
+
+    These are the points at least `margin` from every edge line of `polygon`, so a
+    tessellation of this ring stays that far from the original boundary everywhere, and
+    not only at its sites. Pass it as the `polygon` argument to `weighted_cvt` when the
+    cells should move in as well; `weighted_cvt`'s own `margin` keeps them on the full
+    polygon and only holds the sites back.
+
+    Raises ValueError if `margin` is negative or not finite, or if the offset leaves no
+    area because the margin reaches the polygon's inradius.
+    """
+    if not np.isfinite(margin) or margin < 0.0:
+        raise ValueError("margin must be a non-negative distance")
+    poly, _ = _ring(polygon)
+    ring = poly if margin == 0.0 else _inset_ring(poly, margin)
+    return [(float(x), float(y)) for x, y in ring]
+
+
 def weighted_cvt(
     polygon: Points,
     area_weights: Values,
@@ -267,6 +341,7 @@ def weighted_cvt(
     weight_iter: int = 50,
     damping: float = 0.5,
     neighbour_mode: str = "auto",
+    margin: float = 0.0,
 ) -> WeightedCVT:
     """Tessellate the convex `polygon` so cell areas follow `area_weights`.
 
@@ -289,15 +364,27 @@ def weighted_cvt(
                     collapse cells, so the default stops short of 1.
     neighbour_mode: "auto" (regular triangulation, falling back to all pairs), "hull"
                     (regular triangulation only) or "all" (clip against every site).
+    margin:         keep every site at least `margin` from each edge of the polygon, in
+                    the polygon's own units; 0.0 leaves them free. The cells still tile
+                    the whole polygon, so a site the margin holds back is no longer
+                    exactly its cell's centroid. Tessellate `inset_polygon(polygon,
+                    margin)` instead to pull the cells in with the sites. A margin wide
+                    enough to crowd the sites can put the area targets out of reach,
+                    which leaves `converged` false and cells collapsed.
 
     Returns a :class:`WeightedCVT`. Every site sits on its own cell's centroid and the
-    areas match `area_weights` to `area_tol` unless `converged` says otherwise.
+    areas match `area_weights` to `area_tol` unless `converged` says otherwise. A
+    positive `margin` trades that exact centroidal property for the clearance: a site
+    held back at the margin is the closest point of the inset to its cell's centroid.
+    Raises ValueError if `margin` is negative or leaves no area inside the polygon.
     """
     poly, poly_area2 = _ring(polygon)
     total = poly_area2 / 2.0
     diag = float(np.hypot(*np.ptp(poly, axis=0)))
     if not _is_convex(poly, diag):
         raise ValueError("polygon must be convex")
+    if not np.isfinite(margin) or margin < 0.0:
+        raise ValueError("margin must be a non-negative distance")
 
     weights = np.asarray(area_weights, dtype=float)
     if weights.ndim != 1 or weights.size == 0:
@@ -307,7 +394,13 @@ def weighted_cvt(
     n = int(weights.size)
     targets = total * weights / weights.sum()
 
+    inset: np.ndarray | None = None
+    if margin > 0.0:
+        inset = _inset_ring(poly, margin)  # raises before the Lloyd start runs
+
     sites = np.asarray(lloyd_cvt(poly, n, seed=seed), dtype=float).reshape(n, 2)
+    if inset is not None:
+        sites = _project_to_ring(inset, sites)
     eps = tol * diag
     lam = np.zeros(n)
     cells: list[np.ndarray] = []
@@ -320,9 +413,13 @@ def weighted_cvt(
             if _area(cell) <= 1e-12 * total:  # collapsed cell has no centroid to chase
                 continue
             shifted[i] = _centroid(cell, sites[i])
+        if inset is not None:
+            shifted = _project_to_ring(inset, shifted)
         delta = shifted - sites
         moved = float(np.hypot(*delta.T).max())  # full distance to the centroid, before damping
         sites = sites + damping * delta
+        if inset is not None:  # a convex step stays inside, so this is a no-op unless damping overshoots
+            sites = _project_to_ring(inset, sites)
         if moved <= eps and float(np.abs(areas - targets).max()) <= area_tol * total:
             break
 
@@ -352,6 +449,7 @@ def best_weighted_cvt(
     damping: float = 0.5,
     neighbour_mode: str = "auto",
     area_tol: float = 1e-3,
+    margin: float = 0.0,
 ) -> WeightedCVT:
     """Run the deterministic start plus `k` seeded starts and keep the best result.
 
@@ -361,7 +459,8 @@ def best_weighted_cvt(
     seeded starts have run.
 
     `criterion` is "area_error" (smallest `max_area_error`, default) or "centroid"
-    (smallest worst |site - cell centroid| relative to the diagonal).
+    (smallest worst |site - cell centroid| relative to the diagonal). `margin` is handed
+    to every start, so it holds the sites of whichever result is kept.
     """
     if k < 1:
         raise ValueError("k must be >= 1")
@@ -385,6 +484,7 @@ def best_weighted_cvt(
             weight_iter=weight_iter,
             damping=damping,
             neighbour_mode=neighbour_mode,
+            margin=margin,
         )
         score = (
             result.max_area_error
@@ -429,6 +529,7 @@ def validate_weighted(
     area_weights: Values,
     tol: float = 1e-3,
     area_tol: float = 1e-2,
+    margin: float = 0.0,
 ) -> list[str]:
     """List what is wrong with a weighted tessellation; an empty list means it is fine.
 
@@ -437,6 +538,10 @@ def validate_weighted(
     (times the diagonal) of its own cell's centroid, and that the areas are within
     `area_tol` of the ratio `area_weights` asks for. `weights` are the Laguerre
     potentials, as returned in :attr:`WeightedCVT.weights`.
+
+    A positive `margin` also requires every site to be at least that far from each edge
+    line. A run made with a margin reports sites held at it as not centroidal, which is
+    expected: give `tol` room for that, or check the margin on its own.
     """
     poly, poly_area2 = _ring(polygon)
     total = poly_area2 / 2.0
@@ -455,6 +560,15 @@ def validate_weighted(
         bad.append("area_weights must all be positive and finite")
     if not _inside(poly, pts).all():
         bad.append("site(s) outside the polygon")
+    if margin > 0.0:
+        edge = np.roll(poly, -1, axis=0) - poly
+        rel = pts[:, None, :] - poly[None, :, :]
+        cross = edge[None, :, 0] * rel[:, :, 1] - edge[None, :, 1] * rel[:, :, 0]
+        clearance = cross / np.hypot(edge[:, 0], edge[:, 1])
+        if float(clearance.min()) < margin - 1e-9 * diag:
+            bad.append(
+                f"site(s) within margin of a polygon edge: worst {clearance.min():.6g} < {margin:.6g}"
+            )
     if n > 1:
         gap = np.hypot(pts[:, 0, None] - pts[None, :, 0], pts[:, 1, None] - pts[None, :, 1])
         np.fill_diagonal(gap, np.inf)

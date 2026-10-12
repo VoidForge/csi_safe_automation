@@ -9,8 +9,8 @@ running with the model loaded. Intended order of calls:
 init_pile_layout(polygon, weights=None) generates `coords` with weighted_cvt and
 can stand in for the write_coords() call.
 
-get_utilization() hands the results back; write_test_record() appends them to the
-records CSV; print_vba_log() prints the workbook's own log.
+get_utilization() hands the results back, and print_vba_log() prints the workbook's
+own log.
 
 The records CSV belongs to record_store.py, which reads, checks and appends it. This
 module reads the sheet and hands the row over.
@@ -24,18 +24,11 @@ from __future__ import annotations
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 import xlwings as xw
 
-from record_store import PileRecord, RecordStore
-
 WORKBOOK = "Auto Piling v20260916-0421.xlsm"    # must already be open in Excel
-
-RECORDS_CSV = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"
-                                # the workbook's run-records log; read and appended
-                                # through record_store, one row per record
 
 _wb: xw.Book | None = None      # workbook found on the first call, kept for the session
 _n_coords = 0                   # rows written by the last write_coords() call
@@ -211,6 +204,7 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
                      seed: int | None = None,
                      best_of: int = 0,
                      area_tol: float = 1e-3,
+                     margin: float = 0.0,
                      allow_nonconverged: bool = False,
                      apply: bool = True) -> list[list[float]]:
     """Generate a pile layout on `polygon` and write it to the workbook.
@@ -223,14 +217,18 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
     and the function writes them top to bottom onto the existing rows, so the
     count has to match the prefix column. The prefixes themselves are not touched.
 
-    `best_of` and `area_tol` go through to `weighted_cvt` / `best_weighted_cvt`
-    (`best_of=0` is one deterministic start). A layout whose worst cell misses its
-    target area by more than `area_tol` of the cap area raises unless
-    `allow_nonconverged` is True. With `apply=True` (the default) the function
-    writes the coordinates and pushes them into SAFE through
-    `SAFE_Use.ApplyPileCoordinates1`. With `apply=False` it writes the sheet only
-    and leaves `_n_coords` alone, so `get_utilization()` stays tied to the last
-    `write_coords()` call.
+    `best_of`, `area_tol` and `margin` go through to `weighted_cvt` /
+    `best_weighted_cvt` (`best_of=0` is one deterministic start). `margin` holds
+    every pile at least that far from the cap outline, in the cap's own units; the
+    cells still cover the whole cap, so a pile held back at the margin is not
+    exactly its cell's centroid. A margin with no room left inside the cap raises
+    ValueError. A layout whose worst cell misses its target area by more than
+    `area_tol` of the cap area raises unless `allow_nonconverged` is True, and a
+    margin wide enough to crowd the piles can be what puts those areas out of
+    reach. With `apply=True` (the default) the function writes the coordinates and
+    pushes them into SAFE through `SAFE_Use.ApplyPileCoordinates1`. With
+    `apply=False` it writes the sheet only and leaves `_n_coords` alone, so
+    `get_utilization()` stays tied to the last `write_coords()` call.
 
     Returns the coordinates written, in `write_coords()`'s own shape.
     """
@@ -265,17 +263,19 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
 
     if best_of > 0:
         result = wcvt.best_weighted_cvt(polygon, area_weights, k=best_of,
-                                        seed=seed, area_tol=area_tol)
+                                        seed=seed, area_tol=area_tol,
+                                        margin=margin)
     else:
-        result = wcvt.weighted_cvt(polygon, area_weights,
-                                   seed=seed, area_tol=area_tol)
+        result = wcvt.weighted_cvt(polygon, area_weights, seed=seed,
+                                   area_tol=area_tol, margin=margin)
 
     if not result.converged and not allow_nonconverged:
         raise RuntimeError(
             f"the layout did not reach the requested areas: the worst cell misses its "
             f"target by {result.max_area_error:.3g} of the cap area after "
             f"{result.iterations} iteration(s) (area_tol={area_tol:g}). Nothing was "
-            "written. Loosen area_tol, raise best_of, or pass allow_nonconverged=True."
+            "written. Loosen area_tol, lower margin, raise best_of, or pass "
+            "allow_nonconverged=True."
         )
 
     print(f"{_stamp()}  init_pile_layout: {len(result.sites)} pile(s), "
@@ -349,20 +349,6 @@ def read_pile_values() -> tuple[list[str], list[float]]:
                    _number(xy[i][1], _cell(xy_rng, i, 1)),
                    *ut[i]]
     return prefixes, values
-
-
-def write_test_record() -> list[PileRecord]:
-    """Append the workbook's current pile values as a new row in the records CSV.
-
-    Reads 'Pile Coords' (A = pile prefix, B:C = x and y, H:J = utilization w/o
-    wind, utilization w/ wind and tension surplus) and appends the values, five per
-    pile in the CSV's own column order, to the bottom of data/SWTKT_test_records.csv.
-    record_store writes the row, after checking it against the file's own header.
-    Returns the row appended, one (name, x, y, util_nw, util_w, tension) tuple per
-    pile.
-    """
-    prefixes, values = read_pile_values()
-    return RecordStore.load(RECORDS_CSV).append(values, prefixes=prefixes)
 
 
 def print_vba_log() -> str:
