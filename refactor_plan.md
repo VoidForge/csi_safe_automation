@@ -1,7 +1,9 @@
 # Refactor plan: separate Excel-facing, SAFE-facing and model code
 
 Status: **plan only — no implementation has started.**
-Written: 2026-10-11. Owner: user. Workspace: `c:\dev\csi_safe_automation`.
+Written: 2026-10-11. Revised: 2026-10-17 against the tree after the margin,
+mass-density and demo-script work (`cf38e5f`, `e33eef7`, `c8b131b`).
+Owner: user. Workspace: `c:\dev\csi_safe_automation`.
 
 This document is written to be worked **step by step by several agents**. Read
 §1 and §14 before touching anything, then take one work package from §8 at a
@@ -31,7 +33,8 @@ Non-negotiables carried over from the repository's existing conventions:
 - Every module is fully type-annotated and must be free of Pylance errors.
 - Module docstrings state what the module is for and who it talks to.
 - Tests live in `tests/`, are self-running (no pytest import), and never touch
-  the real `data/SWTKT_test_records.csv` — temp copies only.
+  a real records CSV under `data/` — temp copies only. The live path today is
+  `data/SWTKT_test_records_2026-10-12.csv` (the optimizer's `RECORDS_CSV`).
 - Python for anything that needs `xlwings`: `c:\Python314\python.exe`
   (3.14.4, xlwings 0.37.4). Secondary: `C:\ProgramData\anaconda3\python.exe`
   (3.9, xlwings 0.29.1). There is no venv, no `requirements.txt` and no
@@ -56,6 +59,11 @@ Agents: keep this table current. `status` is one of `todo`, `in-progress`,
 | WP-5 | Retarget `trivial_optimizer.py`; move glue to `safe_use` | WP-4b | todo | |
 | WP-6 | Retire `auto_analysis.py`; update README; mark `.bas` superseded | WP-5 | todo | |
 | WP-7 | End-to-end verification against real Excel + SAFE | WP-6 | todo | owner-supervised, manual |
+
+Re-verified 2026-10-17: still no `excel_io.py`, `safe_library.py` or
+`safe_use.py` in the tree, so every work package remains `todo`. The line
+anchors, file sizes and work-package steps below were re-derived from the
+current tree on that date.
 
 ---
 
@@ -102,24 +110,26 @@ affected work package before continuing.
 
 ---
 
-## 5. Current state (verified 2026-10-11)
+## 5. Current state (verified 2026-10-17)
 
 ### 5.1 File sizes
 
 | File | Lines | Boundary status |
 | ---- | ----: | --------------- |
-| `auto_analysis.py` | 394 | Excel + Excel→SAFE macros + model sheets, all in one module |
+| `auto_analysis.py` | 444 | Excel + Excel→SAFE macros + model sheets, all in one module |
 | `SAFE_Library.bas` | 2,923 | SAFE API + the generic Excel table writer, mixed |
 | `SAFE_Use.bas` | 1,513 | model workflows + Excel range reads/writes, mixed |
 | `Interpolation2D.bas` | 1,397 | out of scope |
-| `trivial_optimizer.py` | 233 | algorithm is clean; `import auto_analysis as aa` at line 45 pulls in xlwings |
+| `trivial_optimizer.py` | 242 | algorithm is clean; `import auto_analysis as aa` at line 45 pulls in xlwings |
 | `record_store.py` | 302 | clean (stdlib `csv` only) |
 | `lloyd_cvt.py` | 306 | clean (numpy) |
-| `weighted_cvt.py` | 482 | clean (numpy/scipy) |
-| `cvt_visualization.ipynb` | 703 | clean (imports `weighted_cvt` only) |
-| `README.md` | 396 | documents the modules above; must be rewritten |
+| `weighted_cvt.py` | 1,034 | clean (numpy/scipy); area and mass-density CVT |
+| `cvt_visualization.ipynb` | 628 | clean (imports `weighted_cvt` only) |
+| `demo_load_rows.py` | 85 | demo of recorded layouts; imports `auto_analysis` (model glue) |
+| `mass_weighted_cvt_plan.md` | 234 | design record for the density work; no code |
+| `README.md` | 391 | documents the modules above; must be rewritten |
 
-### 5.2 `auto_analysis.py` — exact inventory (line anchors are current)
+### 5.2 `auto_analysis.py` — exact inventory (line anchors verified 2026-10-17)
 
 | Lines | Symbol | Category |
 | ----- | ------ | -------- |
@@ -134,25 +144,25 @@ affected work package before continuing.
 | 159 | `_write_coords_range` | model sheet contract + Excel write |
 | 166 | `_utilization` | model sheet contract (`Pile Coords`!H:J) |
 | 178 | `write_coords` | model operation (write B3:C, then run `SAFE_Use.ApplyPileCoordinates1`) |
-| 201 | `init_pile_layout` | model operation (weighted CVT → sheet → SAFE) |
-| 288 | `run_analysis` | Excel→SAFE bridge (`SAFE_Use.RunAnalysis1`) |
-| 295 | `write_reactions` | Excel→SAFE bridge (`SAFE_Use.WriteNodalReactions1`) |
-| 302 | `get_utilization` | model read, gated by `_n_coords` |
-| 315 | `read_pile_values` | model read (A + B:C + H:J in one OLE block) |
-| 347 | `print_vba_log` | bridge to the VBA log (`SAFE_Library.GetLog`) |
-| 372 | `quiet_excel` | Excel quiet mode (generic) |
+| 201–336 | `init_pile_layout` | model operation (weighted CVT → sheet → SAFE; margin and mass-density pass-through) |
+| 338 | `run_analysis` | Excel→SAFE bridge (`SAFE_Use.RunAnalysis1`) |
+| 345 | `write_reactions` | Excel→SAFE bridge (`SAFE_Use.WriteNodalReactions1`) |
+| 352 | `get_utilization` | model read, gated by `_n_coords` |
+| 365 | `read_pile_values` | model read (A + B:C + H:J in one OLE block) |
+| 397 | `print_vba_log` | bridge to the VBA log (`SAFE_Library.GetLog`) |
+| 422 | `quiet_excel` | Excel quiet mode (generic); ends at 444 |
 
 ### 5.3 `trivial_optimizer.py` — the leak
 
 | Lines | Content | Category |
 | ----- | ------- | -------- |
 | 45 | `import auto_analysis as aa` | **the leak** — importing the algorithm requires xlwings |
-| 52 | `RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"` | model glue (the run-records log path) |
-| 55, 57 | `STEP_SIZE`, `DIRECTIONS` | algorithm parameters (already keyword arguments of `optimize`) |
-| 69 | `evaluate` | **model glue**: `aa.write_coords` → `aa.run_analysis` → `aa.write_reactions` → `aa.read_pile_values` → `RecordStore.load(RECORDS_CSV).append(...)` |
-| 91–134 | `governing`, `peak`, `move_pile`, `NoImprovementError` | clean algorithm |
-| 137 | `optimize(*, store, step_size, directions, evaluate_fn=evaluate, ...)` | clean, except the `evaluate_fn` default |
-| 196 | `main` | model glue (prints a summary from the store) |
+| 53 | `RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records_2026-10-12.csv"` (line 52 keeps the old literal commented out) | model glue (the run-records log path) |
+| 56, 58 | `STEP_SIZE`, `DIRECTIONS` | algorithm parameters (already keyword arguments of `optimize`) |
+| 70 | `evaluate` | **model glue**: `aa.write_coords` → `aa.run_analysis` → `aa.write_reactions` → `aa.read_pile_values` → `RecordStore.load(RECORDS_CSV).append(...)` |
+| 92–136 | `governing`, `peak`, `move_pile`, `NoImprovementError` | clean algorithm |
+| 138 | `optimize(*, store=None, ..., evaluate_fn=evaluate, ...)` | clean, except the `evaluate_fn` default; `store=None` loads `RECORDS_CSV` |
+| 197 | `main` | model glue: builds `CAP_POLYGON`, `PILE_WEIGHTS`, `N_PILES` and `MARGIN=3500`, calls `aa.init_pile_layout(...)`, seeds an empty store with that layout, then optimizes inside `aa.quiet_excel()` |
 
 Its own docstring already claims "all model-specific knowledge is confined to
 the model glue block". After this refactor that claim becomes true of the
@@ -164,7 +174,9 @@ the model glue block". After this refactor that claim becomes true of the
   default CSV path by design (`load(path)` requires it) — keep that.
 - `lloyd_cvt.py`, `weighted_cvt.py` import only numpy/scipy.
 - `cvt_visualization.ipynb` imports `weighted_cvt` and uses `matplotlib`.
-- Only `auto_analysis.py` line 30 imports `xlwings`.
+- Only `auto_analysis.py` line 29 imports `xlwings`.
+- `demo_load_rows.py` imports `auto_analysis` at line 22; it is the second
+  module that has to be retargeted before WP-6 deletes `auto_analysis.py`.
 - Nothing in Python imports SAFE today; SAFE is reached only through the VBA
   macros that `auto_analysis.py` runs.
 
@@ -211,9 +223,10 @@ graph TD
 | ------ | ---------- | ----------------- |
 | `safe_library.py` | stdlib, SAFE binding (`clr`/`pythonnet`, or `win32com`) | `xlwings`, `excel_io`, `safe_use` |
 | `excel_io.py` | stdlib, `xlwings` | SAFE bindings, `safe_library`, `safe_use` |
-| `safe_use.py` | stdlib, `excel_io`, `safe_library`, `record_store`, `weighted_cvt` (lazy) | `xlwings`, SAFE bindings, `auto_analysis` |
+| `safe_use.py` | stdlib, `excel_io`, `safe_library`, `record_store`, `weighted_cvt` (lazy), `trivial_optimizer` (lazy) | `xlwings`, SAFE bindings, `auto_analysis` |
 | `record_store.py` | stdlib | everything else |
 | `trivial_optimizer.py` | stdlib, `record_store` | `xlwings`, SAFE bindings, `auto_analysis`, `safe_use`, `excel_io` |
+| `demo_load_rows.py` | stdlib, `safe_use`, `record_store` | `xlwings`, SAFE bindings, `auto_analysis` |
 | `lloyd_cvt.py`, `weighted_cvt.py` | stdlib, numpy, scipy | everything else |
 | `auto_analysis.py` | — | module is deleted (D2) |
 
@@ -390,7 +403,9 @@ directly.
 
 ```python
 WORKBOOK = "Auto Piling v20260916-0421.xlsm"
-RECORDS_CSV = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"
+# The records CSV path is NOT copied here: `evaluate_layout` reads
+# `trivial_optimizer.RECORDS_CSV` at call time (settable, §13). Its current
+# value is data/SWTKT_test_records_2026-10-12.csv.
 
 PILE_SHEET = "Pile Coords";  PILE_FIRST_ROW = 3;  COORD_FIRST_CELL = "B3"
 COORD_RANGE = "A2:C50"                 # Prefix | X | Y, read by apply_pile_coordinates
@@ -427,8 +442,9 @@ def apply_pile_coordinates(sheet_name: str = PILE_SHEET,
 def read_pile_values() -> tuple[list[str], list[float]]
 def get_utilization() -> list[list[float]]
 def init_pile_layout(polygon, weights=None, *, n_piles=None, seed=None, best_of=0,
-                     area_tol=1e-3, margin=0.0, allow_nonconverged=False,
-                     apply=True) -> list[list[float]]
+                     area_tol=1e-3, margin=0.0, density_zones=None,
+                     default_density=1.0, relax_to="area", mass_tol=1e-3,
+                     allow_nonconverged=False, apply=True) -> list[list[float]]
 
 # SAFE work
 def run_analysis() -> None
@@ -443,7 +459,8 @@ def write_table_list(rows, sheet_name: str, start_cell: str) -> int
 def read_coord_table(sheet_name: str, address: str) -> tuple[list[str], list[float], list[float], int]
 
 # optimizer glue (moved out of trivial_optimizer.py)
-def evaluate_layout(coords: list[list[float]], *, records_csv: Path = RECORDS_CSV) -> list[float]
+# records_csv=None -> trivial_optimizer.RECORDS_CSV, read at call time
+def evaluate_layout(coords: list[list[float]], *, records_csv: Path | None = None) -> list[float]
 def optimize_layout() -> None
 
 # helpers
@@ -480,17 +497,24 @@ afterwards, on the normal path **and** the error path.
 
 ### 7.4 `trivial_optimizer.py` (after WP-5)
 
-- Remove `import auto_analysis as aa`, `RECORDS_CSV`, `evaluate`, `main`.
+- Remove `import auto_analysis as aa`, `evaluate`, `main`. Keep `RECORDS_CSV`
+  as the optimizer's own settable setting (line 53, currently
+  `data/SWTKT_test_records_2026-10-12.csv`; §13).
 - `optimize(*, store, evaluate_fn, step_size, directions, max_iterations, log)`:
   `evaluate_fn` becomes a **required** keyword argument (no Excel-importing
-  default).
+  default). `store=None` still resolves to `RecordStore.load(RECORDS_CSV)`.
 - Keep `governing`, `peak`, `move_pile`, `NoImprovementError`, `STEP_SIZE`,
   `DIRECTIONS` and every documented behaviour, including `best_trial_peak`.
-- The old `evaluate` and `main` bodies move to `safe_use.evaluate_layout` /
-  `safe_use.optimize_layout` unchanged in behaviour (including the deliberate
-  `RecordStore.load(RECORDS_CSV).append(values, prefixes=prefixes)` and the
-  optimizer's own `RECORDS_CSV` setting, which per workspace memory is
-  `trivial_optimizer.RECORDS_CSV` and must stay settable there — see §13).
+- The old `evaluate` body (line 70) moves to `safe_use.evaluate_layout`,
+  keeping `RecordStore.load(RECORDS_CSV).append(values, prefixes=prefixes)`.
+  With `records_csv=None` it reads `trivial_optimizer.RECORDS_CSV` at call
+  time, so the documented "set `trivial_optimizer.RECORDS_CSV`" behaviour
+  survives.
+- The old `main` body (line 197) moves to `safe_use.optimize_layout` unchanged:
+  the `CAP_POLYGON` / `PILE_WEIGHTS` / `N_PILES` / `MARGIN=3500` settings, the
+  `init_pile_layout` call, the header-only-store seeding branch, the
+  `quiet_excel` block, the summary line and the re-raise. `aa.init_pile_layout`
+  becomes `safe_use.init_pile_layout`.
 
 ### 7.5 Unchanged modules
 
@@ -498,6 +522,8 @@ afterwards, on the normal path **and** the error path.
 Do not touch them in this refactor except for a docstring pointer if a
 referenced module name disappears (record_store's docstring mentions
 `auto_analysis.py` — that one line is in scope for WP-6).
+`mass_weighted_cvt_plan.md` is the design record for `weighted_cvt`'s density
+work and is likewise out of scope.
 
 ---
 
@@ -566,7 +592,7 @@ work, no renaming of public functions other than the ones listed.
 **Steps.**
 
 1. Move `_stamp`, `_ole`, `_book`, `_number`, `_grid`, `_cell`, `quiet_excel`
-   (lines 40–140, 372–394) into `excel_io.py` as `stamp`, `ole`, `attach`,
+   (lines 40–140 and 421–444) into `excel_io.py` as `stamp`, `ole`, `attach`,
    `number`, `grid`, `cell_address`, `quiet_excel`. Keep the exact log line
    format (`HH:MM:SS.mmm  OLE -> label` / `OLE <- label  (0.123s)` /
    `OLE !! label  (0.123s, RuntimeError)`) and the `flush=True` prints.
@@ -627,14 +653,18 @@ depends on it yet.
 3. Skip modules that do not exist yet (WP-3/WP-4 have not run), and add their
    rows as they appear. The test must *not* silently pass when a module listed
    in §6.3 is missing — print which rows were skipped.
-4. Follow the repo's test style: self-running, no pytest import, clear pass/fail
+4. `demo_load_rows.py` still imports `auto_analysis` today: report that as a
+   known violation on stdout (not a failure) and enforce the row once WP-6
+   retargets the file.
+5. Follow the repo's test style: self-running, no pytest import, clear pass/fail
    summary on stdout.
 
 **Acceptance criteria.**
 
-- The test passes on the current tree (with only the `excel_io` row active) and
-  fails when a violation is introduced (verify by temporarily adding an import
-  in a scratch copy, then reverting).
+- The test passes on the current tree (only the `excel_io` row active;
+  `demo_load_rows.py` reported as a known violation) and fails when a
+  violation is introduced (verify by temporarily adding an import in a scratch
+  copy, then reverting).
 
 **Verification.** `c:\Python314\python.exe tests\test_import_boundaries.py`
 
@@ -818,10 +848,12 @@ two `SAFE_Use.bas` workflows.
    `get_run_case_flags`.
 5. `write_coords(coords)` becomes complete: write `B3:C` via `excel_io`, then
    apply through SAFE (replacing `SAFE_Use.ApplyPileCoordinates1`).
-6. `init_pile_layout(...)`: move from `auto_analysis.py` (208) unchanged except
-   that it calls the new `write_coords` / `write_coord_values`, keeps the lazy
-   `import weighted_cvt`, keeps the prefix-count guard and the convergence
-   report line.
+6. `init_pile_layout(...)`: move from `auto_analysis.py` (201, spanning 136
+   lines) unchanged except that it calls the new `write_coords` /
+   `write_coord_values`, keeps the lazy `import weighted_cvt`, keeps the
+   prefix-count guard and the convergence report line, and passes `margin`,
+   `density_zones`, `default_density`, `relax_to` and `mass_tol` through to
+   `weighted_cvt` / `best_weighted_cvt` exactly as today.
 7. Helpers from `SAFE_Use.bas`: `safe_text` (1455), `num_to_text` (1419, D7),
    `text_to_number` (1378), `scaled_by` (1345), `nearly_equal` (1444),
    `starts_with` (1410), `is_empty_name_argument` (795), `selected_name_count`
@@ -857,17 +889,22 @@ intact (`auto_analysis.py` untouched until WP-6).
 
 **Steps.**
 
-1. Move `evaluate` (69) → `safe_use.evaluate_layout(coords, *, records_csv=RECORDS_CSV)`
-   and `main` (196) → `safe_use.optimize_layout()`, behaviour unchanged
-   (including `RecordStore.load(...).append(values, prefixes=prefixes)` and the
-   summary line printed by `main`).
-2. In `trivial_optimizer.py`: delete `import auto_analysis as aa`,
-   `RECORDS_CSV`, `evaluate`, `main`; make `evaluate_fn` a required keyword
-   argument of `optimize`.
+1. Move `evaluate` (70) → `safe_use.evaluate_layout(coords, *, records_csv=None)`
+   and `main` (197) → `safe_use.optimize_layout()`, behaviour unchanged: the
+   `RecordStore.load(...).append(values, prefixes=prefixes)` write, the
+   `CAP_POLYGON` / `PILE_WEIGHTS` / `N_PILES` / `MARGIN` block, the
+   `init_pile_layout` call, the header-only-store seeding branch, the
+   `quiet_excel` block, the summary line and the re-raise. With `records_csv`
+   omitted, `evaluate_layout` resolves `trivial_optimizer.RECORDS_CSV` at call
+   time.
+2. In `trivial_optimizer.py`: delete `import auto_analysis as aa`, `evaluate`,
+   `main`; make `evaluate_fn` a required keyword argument of `optimize`.
+   `store=None` still loads `RECORDS_CSV`.
 3. Keep `RECORDS_CSV` as `trivial_optimizer`'s own settable setting, per
-   workspace memory: a caller pointing the optimizer at another CSV must set
-   `trivial_optimizer.RECORDS_CSV`. Re-read that memory note before changing
-   anything here.
+   workspace memory, with the current value
+   `data/SWTKT_test_records_2026-10-12.csv`: a caller pointing the optimizer at
+   another CSV must set `trivial_optimizer.RECORDS_CSV`. Re-read that memory
+   note before changing anything here.
 4. Tests: a stub `evaluate_fn` run proving (a) `import trivial_optimizer` works
    with no xlwings, (b) the already-tried skip path, (c) `NoImprovementError`
    with `best_trial_peak` (including `directions=()` → `current_peak`), (d) no
@@ -893,13 +930,16 @@ documentation.
 
 **Depends on.** WP-5.
 
-**Files.** Delete `auto_analysis.py`; edit `README.md`;
-edit `record_store.py`'s one docstring reference; edit `trivial_optimizer.py`'s
-docstring; edit the boundary test.
+**Files.** Delete `auto_analysis.py`; retarget `demo_load_rows.py`; edit
+`README.md`; edit `record_store.py`'s one docstring reference; edit
+`trivial_optimizer.py`'s docstring; edit the boundary test.
 
 **Steps.**
 
-1. Confirm nothing imports `auto_analysis` any more (`grep -rn "auto_analysis"
+1. Retarget `demo_load_rows.py` from `auto_analysis` to `safe_use`
+   (`write_coords` and `run_analysis` keep their names; `write_reactions`
+   becomes `write_nodal_reactions` unless Q4 chooses aliases) and confirm
+   nothing imports `auto_analysis` any more (`grep -rn "auto_analysis"
    --include=*.py --include=*.ipynb .`).
 2. Delete `auto_analysis.py` (D2). If the owner chose the shim alternative,
    replace it with a short deprecated facade that re-exports from `safe_use`
@@ -907,10 +947,11 @@ docstring; edit the boundary test.
 3. `record_store.py`'s docstring says "`auto_analysis.py` reads the sheet and
    hands the flat row here" → change to `safe_use.py`.
 4. `README.md`: rewrite the module table (rows for `excel_io.py`,
-   `safe_library.py`, `safe_use.py`; `auto_analysis.py` removed), the "How to
-   use" steps (the Python path no longer needs the workbook's macros), and the
-   `SAFE_Library.bas` read/write example section (mark the `.bas` modules
-   superseded pending WP-7, per D6 — do not delete them).
+   `safe_library.py`, `safe_use.py`, `demo_load_rows.py`; `auto_analysis.py`
+   removed), the "How to use" steps (the Python path no longer needs the
+   workbook's macros), and the `SAFE_Library.bas` read/write example section
+   (mark the `.bas` modules superseded pending WP-7, per D6 — do not delete
+   them).
 5. Boundary test: add the final assertion that `auto_analysis.py` does not
    exist.
 
@@ -970,13 +1011,15 @@ c:\Python314\python.exe tests\test_import_boundaries.py
 c:\Python314\python.exe tests\test_excel_io.py
 c:\Python314\python.exe tests\test_safe_library.py
 c:\Python314\python.exe tests\test_safe_use.py
+c:\Python314\python.exe tests\test_trivial_optimizer.py
 c:\Python314\python.exe tests\test_weighted_cvt.py
 c:\Python314\python.exe tests\test_against_voronoip.py
 ```
 
 Every test stubs the external seam: `excel_io`'s attach/sheet access on one
 side, the SAFE handle on the other. No test may require Excel, SAFE, a network
-or the real records CSV.
+or a real records CSV from `data/` — the live one today is
+`SWTKT_test_records_2026-10-12.csv`.
 
 ### 9.2 Real (WP-7 only)
 
@@ -1045,6 +1088,7 @@ Excel + SAFE + the model, owner-supervised, recorded in
 - [ ] `load_cases` three-state contract, combinations cleared for the read and restored on both paths.
 - [ ] `read_pile_values` returns `(prefixes, five numbers per pile)` in the records CSV's column order.
 - [ ] `init_pile_layout` keeps the lazy `weighted_cvt` import (no numpy at module import).
+- [ ] `init_pile_layout` keeps the `margin` and mass-density pass-through (`density_zones`, `default_density`, `relax_to`, `mass_tol`).
 
 ---
 
@@ -1084,7 +1128,8 @@ Two notes for the agents:
    docstring and move on.
 2. `trivial_optimizer.RECORDS_CSV` staying settable on the optimizer is an
    existing documented behaviour (workspace memory, 2026-10-07). Keep it; do not
-   "fix" it into a single shared constant.
+   "fix" it into a single shared constant. Its current value is
+   `data/SWTKT_test_records_2026-10-12.csv`.
 
 ---
 
@@ -1100,8 +1145,8 @@ Two notes for the agents:
   comments on model-specific constants. Keep function names recognisably mapped
   to the `.bas` originals so the port stays auditable (see Appendix A).
 - **Tests:** `tests/`, self-running, no pytest import, temp copies of any data
-  file, clear pass/fail summary on stdout. Never touch
-  `data/SWTKT_test_records.csv`.
+  file, clear pass/fail summary on stdout. Never touch a real records CSV under
+  `data/` (the live one is `SWTKT_test_records_2026-10-12.csv`).
 - **Scope discipline:** one work package per change set. If you find something
   outside your work package, record it in the status board; do not fix it.
 - **Memory:** after each work package, append a short section to
@@ -1126,7 +1171,7 @@ Two notes for the agents:
 
 ## Appendix A — Source map (VBA/prototype → target)
 
-Line numbers are current as of 2026-10-11.
+Line numbers are current as of 2026-10-17.
 
 | Origin | Target |
 | ------ | ------ |
@@ -1161,14 +1206,15 @@ Line numbers are current as of 2026-10-11.
 | 1345 `ScaledBy`, 1378 `TextToNumber`, 1410 `StartsWith`, 1419 `NumToText`, 1425 `NumFromText`, 1432 `ToDouble`, 1444 `NearlyEqual`, 1455 `SafeText` | `safe_use` helpers |
 | 1465 `TableFieldUnits` | `safe_library.table_field_units` |
 | 113 `Say` | `safe_use.say` |
-| `auto_analysis.py` 40/46/69/113/128/137/372 | `excel_io` |
-| 142/159/166/178/302/315/347/201 | `safe_use` |
-| 97/288/295/347 | deleted (macro bridge) |
+| `auto_analysis.py` 40/46/69/113/128/137/422 | `excel_io` |
+| 142/159/166/178/352/365/397/201–336 | `safe_use` |
+| 97/338/345/397 | deleted (macro bridge) |
 | 34 `_n_coords` | deleted |
 | 31 `WORKBOOK` | `safe_use` settings block |
-| `trivial_optimizer.py` 69 `evaluate` | `safe_use.evaluate_layout` |
-| 196 `main` | `safe_use.optimize_layout` |
-| 52 `RECORDS_CSV` | stays on `trivial_optimizer` (the literal path, settable) |
+| `trivial_optimizer.py` 70 `evaluate` | `safe_use.evaluate_layout` |
+| 197 `main` | `safe_use.optimize_layout` |
+| 53 `RECORDS_CSV` | stays on `trivial_optimizer` (the literal path, settable, `SWTKT_test_records_2026-10-12.csv`) |
+| `demo_load_rows.py` 22/26 | retarget to `safe_use` in WP-6 |
 
 ## Appendix B — Model facts the port must respect
 
@@ -1179,6 +1225,9 @@ Line numbers are current as of 2026-10-11.
   table listings written by `write_table_list`.
 - SAFE table keys used: `Point Object Connectivity` (editing),
   `Joint Reactions` (display), plus whatever `list_safe_tables` reports.
+- Records CSV used by the optimizer today:
+  `data/SWTKT_test_records_2026-10-12.csv`; `data/SWTKT_test_records.csv` and
+  the two 2026-10-11 files are older runs and must not be written by tests.
 - Verified against `reference/SAFE Input&Output Table Key List.csv` (257 rows;
   Import Type counts 2:111, 3:80, 0:60, 1:6).
 - Reference material (gitignored, read-only): the decompiled CSI API help in
