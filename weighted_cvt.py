@@ -4,18 +4,26 @@ Each site carries an additive weight and owns the set of points closer to it in 
 power metric ``|x - p_i|^2 - w_i``. The weights are solved so that the cells come out in
 the requested area ratio, and every site is relaxed onto its own cell's centroid.
 
-The caller's area weight is a target, and ``A_i / A = area_weights[i] /
-sum(area_weights)``. The Laguerre weights that realise it are solved internally and come
+The caller's area weight is a target, and ``A_i / A = cell_weights[i] /
+sum(cell_weights)``. The Laguerre weights that realise it are solved internally and come
 back in ``WeightedCVT.weights``; they follow the requested ratios monotonically, though
 they are not proportional to them.
+
+A call may also prescribe a mass density field, through `density_zones` (one density per
+polygon) plus `default_density`. The field is additive: the density at a point is
+``default_density`` plus the density of every zone that contains it, so overlapping zones
+add up. Each cell is then driven to the same share of the total *mass* rather than of the
+area, ``M_i / M = cell_weights[i] / sum(cell_weights)``, and `relax_to` picks whether a
+site follows its cell's area centroid or its centre of mass. With no zone and a unit
+default density there is no field at all, and the run is the plain area one.
 
 `weighted_cvt` takes a `margin` that holds every site at least that far from each edge,
 and `inset_polygon` returns the ring that does the same for the cells.
 
 Public interface: `weighted_cvt` to generate a layout, `best_weighted_cvt` to pick the
 best of several starts, `inset_polygon` for the ring offset inward by a margin, and
-`power_cells` / `cell_areas` / `validate_weighted` to inspect one. numpy and scipy only;
-the geometry primitives come from `lloyd_cvt`.
+`power_cells` / `cell_areas` / `cell_masses` / `validate_weighted` to inspect one. numpy
+and scipy only; the geometry primitives come from `lloyd_cvt`.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ __all__ = [
     "inset_polygon",
     "power_cells",
     "cell_areas",
+    "cell_masses",
     "validate_weighted",
 ]
 
@@ -52,6 +61,11 @@ class WeightedCVT(NamedTuple):
     areas those ratios ask for. ``max_area_error`` is
     ``max |areas - targets| / total area`` and ``converged`` records whether the run
     reached the requested ``area_tol``.
+
+    ``masses``, ``mass_targets`` and ``max_mass_error`` describe the same run against the
+    mass objective, and repeat the area figures when no density field was given. With a
+    field, ``converged`` refers to ``max_mass_error`` against ``mass_tol`` instead, and
+    ``targets`` is only the area ratio that was asked for.
     """
 
     sites: list[tuple[float, float]]
@@ -61,6 +75,9 @@ class WeightedCVT(NamedTuple):
     iterations: int
     max_area_error: float
     converged: bool
+    masses: list[float]
+    mass_targets: list[float]
+    max_mass_error: float
 
 
 def _is_convex(poly: np.ndarray, diag: float) -> bool:
@@ -69,6 +86,251 @@ def _is_convex(poly: np.ndarray, diag: float) -> bool:
     cross = edge[:, 0] * np.roll(edge[:, 1], -1) - edge[:, 1] * np.roll(edge[:, 0], -1)
     tol = 1e-9 * diag * diag
     return bool((cross >= -tol).all() or (cross <= tol).all())
+
+
+class _DensityField(NamedTuple):
+    """Additive, piecewise-constant mass density over the tessellated polygon.
+
+    ``triangles`` are a true triangulation of every `density_zones` polygon and
+    ``densities`` holds the matching density per triangle, which may be negative.
+    ``default`` is the density of everything no triangle covers, and ``total`` the mass of
+    the whole polygon. The density at a point is ``default`` plus one ``densities`` entry
+    per triangle containing it, so overlapping zones add up.
+    """
+
+    triangles: list[np.ndarray]
+    densities: np.ndarray
+    default: float
+    total: float
+
+
+def _segments_meet(p: np.ndarray, d1: np.ndarray, q: np.ndarray, d2: np.ndarray) -> bool:
+    """Whether the segments ``p + t d1`` and ``q + u d2`` meet for t, u in [0, 1]."""
+    den = d1[0] * d2[1] - d1[1] * d2[0]
+    rel = q - p
+    if den == 0.0:  # parallel, so only a collinear overlap counts
+        if rel[0] * d1[1] - rel[1] * d1[0] != 0.0:
+            return False
+        t = float(rel @ d1) / float(d1 @ d1)
+        t2 = t + float(d2 @ d1) / float(d1 @ d1)
+        return min(t, t2) <= 1.0 and max(t, t2) >= 0.0
+    t = (rel[0] * d2[1] - rel[1] * d2[0]) / den
+    u = (rel[0] * d1[1] - rel[1] * d1[0]) / den
+    return 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0
+
+
+def _ring_is_simple(ring: np.ndarray) -> bool:
+    """Whether no two non-adjacent edges of the closed `ring` meet at all."""
+    edges = np.roll(ring, -1, axis=0) - ring
+    m = len(ring)
+    for i in range(m):
+        for j in range(i + 1, m):
+            if j == i + 1 or (i == 0 and j == m - 1):  # neighbours share a vertex
+                continue
+            if _segments_meet(ring[i], edges[i], ring[j], edges[j]):
+                return False
+    return True
+
+
+def _in_triangle(pt: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray,
+                 tol: float) -> bool:
+    """Whether `pt` is inside or on the counter-clockwise triangle a-b-c."""
+    for p, q in ((a, b), (b, c), (c, a)):
+        if (q[0] - p[0]) * (pt[1] - p[1]) - (q[1] - p[1]) * (pt[0] - p[0]) < -tol:
+            return False
+    return True
+
+
+def _ear_clip(poly: np.ndarray, tol: float, label: str) -> list[np.ndarray]:
+    """Ear-clip the simple, counter-clockwise, non-convex `poly` into triangles."""
+    remaining = list(range(len(poly)))
+    out: list[np.ndarray] = []
+    while len(remaining) > 3:
+        for pos, k in enumerate(remaining):
+            prev = poly[remaining[pos - 1]]
+            cur = poly[k]
+            nxt = poly[remaining[(pos + 1) % len(remaining)]]
+            corner = (cur - prev)[0] * (nxt - cur)[1] - (cur - prev)[1] * (nxt - cur)[0]
+            if corner <= tol:  # reflex or flat, so not an ear
+                continue
+            if any(
+                _in_triangle(poly[j], prev, cur, nxt, tol)
+                for j in remaining
+                if j != remaining[pos - 1] and j != k and j != remaining[(pos + 1) % len(remaining)]
+            ):
+                continue
+            out.append(np.array([prev, cur, nxt]))
+            remaining.pop(pos)
+            break
+        else:
+            raise ValueError(
+                f"{label} could not be triangulated; it may cross itself or hold a "
+                "vertex on another edge"
+            )
+    out.append(np.array([poly[remaining[0]], poly[remaining[1]], poly[remaining[2]]]))
+    return out
+
+
+def _triangulate(polygon: Points, label: str) -> list[np.ndarray]:
+    """True triangulation of the simple `label` polygon, on the polygon's own vertices.
+
+    Repeated and collinear vertices are dropped, then the polygon is oriented
+    counter-clockwise. A convex one is fanned from its first vertex and a non-convex one
+    is ear-clipped, so every triangle has positive area and no vertex is invented. Raises
+    ValueError for a polygon that is degenerate or crosses itself.
+    """
+    poly = np.asarray(polygon, dtype=float)
+    if poly.ndim != 2 or poly.shape[1] != 2 or len(poly) < 3:
+        raise ValueError(f"{label} must be an (M, 2) polygon with M >= 3")
+    if np.all(poly[0] == poly[-1]):
+        poly = poly[:-1]
+    diag = float(np.hypot(*np.ptp(poly, axis=0)))
+    if diag <= 0.0:
+        raise ValueError(f"{label} has no extent")
+    eps = 1e-12 * diag
+    keep = [0]
+    for k in range(1, len(poly)):
+        if float(np.hypot(*(poly[k] - poly[keep[-1]]))) > eps:
+            keep.append(k)
+    poly = poly[keep]
+    changed = len(poly) > 3
+    while changed:  # a vertex on a straight run cannot be an ear
+        changed = False
+        keep = []
+        for k in range(len(poly)):
+            prev, cur, nxt = poly[k - 1], poly[k], poly[(k + 1) % len(poly)]
+            a, b = cur - prev, nxt - cur
+            if abs(float(a[0] * b[1] - a[1] * b[0])) <= eps * diag:
+                changed = True
+                continue
+            keep.append(k)
+        poly = poly[keep]
+    if len(poly) < 3:
+        raise ValueError(f"{label} needs 3 distinct corners, has {len(poly)}")
+    area2 = float((poly[:, 0] * np.roll(poly[:, 1], -1) - np.roll(poly[:, 0], -1) * poly[:, 1]).sum())
+    if abs(area2) <= eps * diag:
+        raise ValueError(f"{label} encloses no area")
+    if area2 < 0.0:
+        poly = poly[::-1]
+    if not _ring_is_simple(poly):
+        raise ValueError(f"{label} crosses itself")
+    if _is_convex(poly, diag):
+        return [np.array([poly[0], poly[k], poly[k + 1]]) for k in range(1, len(poly) - 1)]
+    return _ear_clip(poly, eps * diag, label)
+
+
+def _density_field(
+    poly: np.ndarray,
+    density_zones: Sequence[tuple[Points, float]] | None,
+    default_density: float,
+) -> _DensityField | None:
+    """Build the density field, or None when no density was asked for.
+
+    None means empty `density_zones` and a unit default density, which leaves the mass
+    objective identical to the area one, so every caller keeps its plain path. Raises
+    ValueError for a non-finite density, a polygon that is degenerate or crossing itself,
+    or a field whose total mass is not positive.
+    """
+    if not np.isfinite(default_density):
+        raise ValueError("default_density must be a finite density")
+    pairs = [] if density_zones is None else list(density_zones)
+    if not pairs and float(default_density) == 1.0:
+        return None
+    triangles: list[np.ndarray] = []
+    densities: list[float] = []
+    for k, entry in enumerate(pairs):
+        try:
+            polygon, density = entry
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"density_zones[{k}] must be a (polygon, density) pair, got {entry!r}"
+            ) from exc
+        density = float(density)
+        if not np.isfinite(density):
+            raise ValueError(f"density_zones[{k}] density must be finite, got {density!r}")
+        for tri in _triangulate(polygon, f"density_zones[{k}]"):
+            triangles.append(tri)
+            densities.append(density)
+    total = float(default_density) * _area(poly)
+    for tri, density in zip(triangles, densities):
+        total += density * _area(_intersection(poly, tri))
+    if not total > 0.0:
+        raise ValueError(
+            f"the mass density field leaves a total mass of {total:g}; it must be positive"
+        )
+    return _DensityField(triangles, np.asarray(densities, dtype=float),
+                         float(default_density), float(total))
+
+
+def _intersection(ring: np.ndarray, piece: np.ndarray) -> np.ndarray:
+    """`ring` clipped to the convex counter-clockwise `piece`; empty if they miss.
+
+    Both rings must be convex. Each edge of `piece` is one half-plane and the clip keeps
+    the side the piece lies on, so the result is the convex intersection. Fewer than 3
+    points mean no area; a 2-point `ring` (a segment) comes back as a collinear point
+    list, which is what the face-density integral clips.
+    """
+    cell = np.asarray(ring, dtype=float)
+    if len(cell) < 2:  # an empty or single-point ring has neither area nor length
+        return np.empty((0, 2))
+    for k in range(len(piece)):
+        edge = piece[(k + 1) % len(piece)] - piece[k]
+        inward = np.array([-edge[1], edge[0]])  # interior side of a CCW edge
+        s = (cell - piece[k]) @ inward
+        if s.max() <= 0.0:  # touch at most a single point, so no area and no length
+            return np.empty((0, 2))
+        cell = _clip(cell, -s)
+        if len(cell) < 2:
+            return np.empty((0, 2))
+    return cell
+
+
+def _cell_mass(cell: np.ndarray, field: _DensityField | None) -> float:
+    """Mass the convex `cell` covers under `field`, or its area when there is no field."""
+    if field is None:
+        return _area(cell)
+    mass = field.default * _area(cell)
+    for tri, density in zip(field.triangles, field.densities):
+        mass += density * _area(_intersection(cell, tri))
+    return float(mass)
+
+
+def _cell_mass_moment(cell: np.ndarray, field: _DensityField) -> tuple[float, np.ndarray]:
+    """Mass the convex `cell` covers under `field`, and its first moment ``int rho x dA``."""
+    mass = field.default * _area(cell)
+    moment = mass * _centroid(cell, cell[0])
+    for tri, density in zip(field.triangles, field.densities):
+        piece = _intersection(cell, tri)
+        if len(piece) < 3:
+            continue
+        part = density * _area(piece)
+        mass += part
+        moment = moment + part * _centroid(piece, piece[0])
+    return float(mass), moment
+
+
+def _face_density_integral(a: np.ndarray, b: np.ndarray, field: _DensityField) -> float:
+    """Integral of the density along the segment `a`-`b`, the mass a face moves per unit
+    of boundary shift.
+
+    The field is additive, so the background contributes its density over the whole
+    segment and every triangle adds its own overlap with it; no union is needed, and a
+    face lying in a light or negated region simply weighs less.
+    """
+    d = b - a
+    length = float(np.hypot(*d))
+    if length <= 0.0:
+        return 0.0
+    seg = np.array([a, b], dtype=float)
+    span_scale = float(d @ d)
+    total = field.default * length
+    for tri, density in zip(field.triangles, field.densities):
+        piece = _intersection(seg, tri)
+        if len(piece) < 2:
+            continue
+        t = (piece - a) @ d / span_scale
+        total += density * length * float(t.max() - t.min())
+    return float(total)
 
 
 def _lifted_neighbours(sites: np.ndarray, lam: np.ndarray) -> list[tuple[int, int]] | None:
@@ -141,13 +403,17 @@ def _power_cells(
     return cells
 
 
-def _jacobian(cells: list[np.ndarray], sites: np.ndarray, lam: np.ndarray, diag: float) -> np.ndarray:
-    """d A_i / d lam_j for the current cells.
+def _jacobian(cells: list[np.ndarray], sites: np.ndarray, lam: np.ndarray, diag: float,
+              field: _DensityField | None = None) -> np.ndarray:
+    """d M_i / d lam_j for the current cells, or d A_i / d lam_j with no field.
 
     Off the diagonal this is ``-|e_ij| / (2 |p_i - p_j|)``, the area a shared face gains
     or loses per unit of weight, and the diagonal is minus its row sum because the areas
-    always add up to the polygon. The matrix is symmetric and singular along the
-    constants: shifting every weight leaves the diagram unchanged.
+    always add up to the polygon. With a density field the face length becomes the
+    density integral along that face, which is the mass the face moves; the column sums
+    still vanish because the total mass does not depend on the weights either. The matrix
+    is symmetric and singular along the constants: shifting every weight leaves the
+    diagram unchanged.
     """
     n = len(sites)
     jac = np.zeros((n, n))
@@ -181,7 +447,11 @@ def _jacobian(cells: list[np.ndarray], sites: np.ndarray, lam: np.ndarray, diag:
             dist = float(np.linalg.norm(sites[i] - sites[partner]))
             if dist <= 1e-12 * diag:
                 continue
-            wgt = float(length[e]) / (2.0 * dist)
+            measure = (
+                float(length[e]) if field is None
+                else _face_density_integral(cell[e], nxt[e], field)
+            )
+            wgt = measure / (2.0 * dist)
             jac[i, partner] -= wgt
             jac[partner, i] -= wgt
             jac[i, i] += wgt
@@ -194,30 +464,38 @@ def _solve_weights(
     sites: np.ndarray,
     lam: np.ndarray,
     targets: np.ndarray,
-    area_tol: float,
+    tol: float,
     max_iter: int,
     mode: str,
+    field: _DensityField | None = None,
 ) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
-    """Damped Newton on the Laguerre weights until the cell areas hit `targets`.
+    """Damped Newton on the Laguerre weights until the cells hit `targets`.
+
+    What is driven to `targets` is the cell mass when `field` is given and the cell area
+    otherwise, so the residual, the tolerance and `targets` itself are all in the same
+    unit.
 
     A site whose cell has been squeezed to nothing has no faces, so its Jacobian row is
     empty and a plain Newton step leaves it there. When no undamped step helps, the solve
     escalates a Levenberg damping term, which gives every empty row a step that grows the
-    cell back. The damping changes only the step size, so the areas still converge to
-    `targets`.
+    cell back. The damping changes only the step size, so the measures still converge to
+    `targets`. A trial that collapses a cell is refused because that cell's site would
+    have nothing left to chase, but under a density field a cell measure of zero or less
+    is not refused on its own: a subtracting zone can leave a cell there while the weights
+    grow it back towards a positive target.
     """
     diag = float(np.hypot(*np.ptp(poly, axis=0)))
     total = float(targets.sum())
     lam = np.asarray(lam, dtype=float)
     lam = lam - float(lam.mean())
     cells = _power_cells(poly, sites, lam, mode)
-    areas = np.array([_area(c) for c in cells])
+    values = np.array([_cell_mass(c, field) for c in cells])
     for _ in range(max(1, max_iter)):
-        if float(np.abs(areas - targets).max()) <= area_tol * total:
+        if float(np.abs(values - targets).max()) <= tol * total:
             break
-        residual = areas - targets
+        residual = values - targets
         base = float(np.linalg.norm(residual))
-        jac = _jacobian(cells, sites, lam, diag)
+        jac = _jacobian(cells, sites, lam, diag, field)
         jscale = max(float(np.abs(jac).max()), 1e-12)
         improved = False
         for mult in (0.0, 1e-2, 1e-1):  # plain Newton first, then Levenberg damping
@@ -233,9 +511,16 @@ def _solve_weights(
                 trial = lam + shrink * step
                 trial = trial - float(trial.mean())
                 trial_cells = _power_cells(poly, sites, trial, mode)
-                trial_areas = np.array([_area(c) for c in trial_cells])
-                if trial_areas.min() > 0.0 and float(np.linalg.norm(trial_areas - targets)) < base:
-                    lam, cells, areas = trial, trial_cells, trial_areas
+                trial_values = np.array([_cell_mass(c, field) for c in trial_cells])
+                if field is None:
+                    alive = trial_values.min() > 0.0  # a collapsed cell has no centroid
+                else:
+                    # A mass may legitimately be zero or negative under a subtracting
+                    # zone, and the weights can still grow it; a collapsed cell cannot,
+                    # so only that is refused here.
+                    alive = min(_area(c) for c in trial_cells) > 0.0
+                if alive and float(np.linalg.norm(trial_values - targets)) < base:
+                    lam, cells, values = trial, trial_cells, trial_values
                     improved = True
                     break
                 shrink *= 0.5
@@ -243,7 +528,7 @@ def _solve_weights(
                 break
         if not improved:
             break  # no damping level helped, so let the outer loop decide
-    return lam, cells, areas
+    return lam, cells, values
 
 
 def _inset_ring(poly: np.ndarray, margin: float) -> np.ndarray:
@@ -296,18 +581,28 @@ def _project_to_ring(ring: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return out
 
 
-def _centroid_error(poly: np.ndarray, sites: np.ndarray, lam: np.ndarray) -> float:
-    """Worst |site - own cell centroid| as a fraction of the polygon's diagonal."""
+def _centroid_error(poly: np.ndarray, sites: np.ndarray, lam: np.ndarray,
+                    field: _DensityField | None = None, relax_to: str = "area") -> float:
+    """Worst |site - own cell's reference point| as a fraction of the polygon's diagonal.
+
+    The reference point is the centre of mass when `field` is given and `relax_to` is
+    "mass", and the area centroid otherwise, so it is whichever point the caller asked
+    the sites to sit on.
+    """
     diag = float(np.hypot(*np.ptp(poly, axis=0)))
     cells = _power_cells(poly, sites, lam, "auto")
-    worst = max(
-        (
-            float(np.linalg.norm(_centroid(cell, sites[i]) - sites[i]))
-            for i, cell in enumerate(cells)
-            if _area(cell) > 0.0
-        ),
-        default=0.0,
-    )
+    worst = 0.0
+    for i, cell in enumerate(cells):
+        if _area(cell) <= 0.0:
+            continue
+        if field is not None and relax_to == "mass":
+            mass, moment = _cell_mass_moment(cell, field)
+            if mass <= 0.0:
+                continue
+            ref = moment / mass
+        else:
+            ref = _centroid(cell, sites[i])
+        worst = max(worst, float(np.linalg.norm(ref - sites[i])))
     return worst / diag
 
 
@@ -332,7 +627,7 @@ def inset_polygon(polygon: Points, margin: float) -> list[tuple[float, float]]:
 
 def weighted_cvt(
     polygon: Points,
-    area_weights: Values,
+    cell_weights: Values,
     *,
     seed: int | None = None,
     tol: float = 1e-9,
@@ -342,21 +637,28 @@ def weighted_cvt(
     damping: float = 0.5,
     neighbour_mode: str = "auto",
     margin: float = 0.0,
+    density_zones: Sequence[tuple[Points, float]] | None = None,
+    default_density: float = 1.0,
+    relax_to: str = "area",
+    mass_tol: float = 1e-3,
 ) -> WeightedCVT:
-    """Tessellate the convex `polygon` so cell areas follow `area_weights`.
+    """Tessellate the convex `polygon` so cell areas, or masses, follow `cell_weights`.
 
     polygon:        (M, 2) boundary coordinates, M >= 3, counter-clockwise. A clockwise
                     ring is re-oriented and a repeated closing vertex is dropped. The
                     polygon must be convex.
-    area_weights:   one positive weight per site; cell `i` is driven towards
-                    ``polygon area * area_weights[i] / sum(area_weights)``. The number of
+    cell_weights:   one positive weight per site; cell `i` is driven towards
+                    ``polygon area * cell_weights[i] / sum(cell_weights)``, or the same
+                    share of the total mass once a density field is given. The number of
                     sites is the length of this sequence.
     seed:           None -> the deterministic equal-area CVT is the start; an int ->
                     a random start from that seed. Either way the same input gives the
                     same output.
     tol:            stop once the largest site move in an outer step falls below `tol`
                     times the polygon's bounding-box diagonal.
-    area_tol:       stop once the largest relative area error falls below this.
+    area_tol:       stop once the largest relative area error falls below this. A density
+                    field hands the job to `mass_tol` instead, though this still decides
+                    what the reported area figures are worth.
     max_iter:       cap on the outer (weights then Lloyd) iterations.
     weight_iter:    cap on the inner damped-Newton weight solves.
     damping:        fraction of the way to its cell centroid a site moves each outer
@@ -369,14 +671,39 @@ def weighted_cvt(
                     the whole polygon, so a site the margin holds back is no longer
                     exactly its cell's centroid. Tessellate `inset_polygon(polygon,
                     margin)` instead to pull the cells in with the sites. A margin wide
-                    enough to crowd the sites can put the area targets out of reach,
-                    which leaves `converged` false and cells collapsed.
+                    enough to crowd the sites can put the targets out of reach, which
+                    leaves `converged` false and cells collapsed.
+    density_zones:  optional sequence of ``(polygon, density)`` pairs, in the polygon's
+                    own coordinates. Each polygon is a zone of constant density on top of
+                    the background, and the field is additive: the density at a point is
+                    `default_density` plus the density of every zone holding it, so
+                    overlapping zones add up and a zone reaching outside the polygon only
+                    counts where it overlaps it. A zone polygon must be simple and
+                    enclose non-zero area; it may be convex or not, and a non-convex one
+                    is ear-clipped into triangles internally. A density may be negative,
+                    which makes that zone subtract from the background. Passing any zone,
+                    or a `default_density` other than 1.0, switches the run from areas to
+                    masses; with neither, no field is built and the run is the plain one.
+    default_density: density of the parts of the polygon no zone covers.
+    relax_to:       "area" (default) puts every site on its own cell's area centroid;
+                    "mass" puts it on the cell's centre of mass, the centroid of the mass
+                    the cell holds. The two agree wherever the density is uniform, and
+                    "mass" is what a capacity-constrained layout usually wants. A
+                    subtracting zone can drag a centre of mass outside the cell, and even
+                    outside the polygon; a site is only moved to a point that lies in the
+                    polygon, so such a cell holds its site and the weights do the work.
+    mass_tol:       stop once the largest relative mass error falls below this; it takes
+                    over from `area_tol` as the convergence test while a field is active.
 
-    Returns a :class:`WeightedCVT`. Every site sits on its own cell's centroid and the
-    areas match `area_weights` to `area_tol` unless `converged` says otherwise. A
-    positive `margin` trades that exact centroidal property for the clearance: a site
-    held back at the margin is the closest point of the inset to its cell's centroid.
-    Raises ValueError if `margin` is negative or leaves no area inside the polygon.
+    Returns a :class:`WeightedCVT`. Every site sits on its own cell's reference point
+    (area centroid or centre of mass, per `relax_to`), and the areas match `cell_weights`
+    to `area_tol`, or the masses to `mass_tol`, unless `converged` says otherwise. A
+    positive `margin` trades that exact centroidal property for the clearance: a site held
+    back at the margin is the closest point of the inset to its cell's centroid. Raises
+    ValueError if `margin` is negative or leaves no area inside the polygon, if `relax_to`
+    is neither "area" nor "mass", or if the density field is malformed or carries no
+    mass. A field can also make a target unreachable, e.g. where it asks for mass in a
+    region holding none; that shows up as `converged` false rather than as an error.
     """
     poly, poly_area2 = _ring(polygon)
     total = poly_area2 / 2.0
@@ -385,14 +712,22 @@ def weighted_cvt(
         raise ValueError("polygon must be convex")
     if not np.isfinite(margin) or margin < 0.0:
         raise ValueError("margin must be a non-negative distance")
+    if relax_to not in ("area", "mass"):
+        raise ValueError("relax_to must be 'area' or 'mass'")
 
-    weights = np.asarray(area_weights, dtype=float)
+    weights = np.asarray(cell_weights, dtype=float)
     if weights.ndim != 1 or weights.size == 0:
-        raise ValueError("area_weights must be a 1-D sequence of positive numbers")
+        raise ValueError("cell_weights must be a 1-D sequence of positive numbers")
     if not np.isfinite(weights).all() or (weights <= 0.0).any():
-        raise ValueError("area_weights must all be positive and finite")
+        raise ValueError("cell_weights must all be positive and finite")
     n = int(weights.size)
-    targets = total * weights / weights.sum()
+    field = _density_field(poly, density_zones, default_density)  # raises before any work
+
+    area_targets = total * weights / weights.sum()
+    mass_targets = area_targets if field is None else field.total * weights / weights.sum()
+    targets = mass_targets if field is not None else area_targets
+    active_tol = mass_tol if field is not None else area_tol
+    active_total = total if field is None else field.total
 
     inset: np.ndarray | None = None
     if margin > 0.0:
@@ -404,42 +739,64 @@ def weighted_cvt(
     eps = tol * diag
     lam = np.zeros(n)
     cells: list[np.ndarray] = []
-    areas = np.zeros(n)
+    values = np.zeros(n)
     iterations = 0
     for iterations in range(1, max_iter + 1):
-        lam, cells, areas = _solve_weights(poly, sites, lam, targets, area_tol, weight_iter, neighbour_mode)
+        lam, cells, values = _solve_weights(
+            poly, sites, lam, targets, active_tol, weight_iter, neighbour_mode, field
+        )
         shifted = sites.copy()
         for i, cell in enumerate(cells):
-            if _area(cell) <= 1e-12 * total:  # collapsed cell has no centroid to chase
+            if _area(cell) <= 1e-12 * total:  # collapsed cell has nothing to chase
                 continue
-            shifted[i] = _centroid(cell, sites[i])
+            if field is None or relax_to == "area":
+                shifted[i] = _centroid(cell, sites[i])
+                continue
+            mass, moment = _cell_mass_moment(cell, field)
+            if mass <= 0.0:  # a massless or negated cell has no centre of mass
+                continue
+            ref = moment / mass
+            # A subtracting zone can put the centre of mass outside the cell, and even
+            # outside the polygon; that point is then no place for a site to sit, so the
+            # site stays where it is and only the weights move the boundary.
+            if _inside(poly, ref.reshape(1, 2))[0]:
+                shifted[i] = ref
         if inset is not None:
             shifted = _project_to_ring(inset, shifted)
         delta = shifted - sites
-        moved = float(np.hypot(*delta.T).max())  # full distance to the centroid, before damping
+        moved = float(np.hypot(*delta.T).max())  # full distance to the target, before damping
         sites = sites + damping * delta
         if inset is not None:  # a convex step stays inside, so this is a no-op unless damping overshoots
             sites = _project_to_ring(inset, sites)
-        if moved <= eps and float(np.abs(areas - targets).max()) <= area_tol * total:
+        if moved <= eps and float(np.abs(values - targets).max()) <= active_tol * active_total:
             break
 
-    lam, cells, areas = _solve_weights(poly, sites, lam, targets, area_tol, weight_iter, neighbour_mode)
-    error = float(np.abs(areas - targets).max() / total)
+    lam, cells, values = _solve_weights(
+        poly, sites, lam, targets, active_tol, weight_iter, neighbour_mode, field
+    )
+    areas = values if field is None else np.array([_area(c) for c in cells])
+    masses = values if field is not None else areas
+    max_area_error = float(np.abs(areas - area_targets).max() / total)
+    max_mass_error = float(np.abs(masses - mass_targets).max() / active_total)
+    error = max_mass_error if field is not None else max_area_error
     order = sorted(range(n), key=lambda i: (-sites[i, 1], sites[i, 0]))
     return WeightedCVT(
         sites=[(float(sites[i, 0]), float(sites[i, 1])) for i in order],
         weights=[float(lam[i]) for i in order],
         areas=[float(areas[i]) for i in order],
-        targets=[float(targets[i]) for i in order],
+        targets=[float(area_targets[i]) for i in order],
         iterations=int(iterations),
-        max_area_error=error,
-        converged=bool(error <= area_tol),
+        max_area_error=max_area_error,
+        converged=bool(error <= active_tol),
+        masses=[float(masses[i]) for i in order],
+        mass_targets=[float(mass_targets[i]) for i in order],
+        max_mass_error=max_mass_error,
     )
 
 
 def best_weighted_cvt(
     polygon: Points,
-    area_weights: Values,
+    cell_weights: Values,
     k: int = 8,
     *,
     criterion: str = "area_error",
@@ -450,6 +807,10 @@ def best_weighted_cvt(
     neighbour_mode: str = "auto",
     area_tol: float = 1e-3,
     margin: float = 0.0,
+    density_zones: Sequence[tuple[Points, float]] | None = None,
+    default_density: float = 1.0,
+    relax_to: str = "area",
+    mass_tol: float = 1e-3,
 ) -> WeightedCVT:
     """Run the deterministic start plus `k` seeded starts and keep the best result.
 
@@ -458,15 +819,19 @@ def best_weighted_cvt(
     deterministic start, that seed, then further seeds from `range(k)` until `k`
     seeded starts have run.
 
-    `criterion` is "area_error" (smallest `max_area_error`, default) or "centroid"
-    (smallest worst |site - cell centroid| relative to the diagonal). `margin` is handed
-    to every start, so it holds the sites of whichever result is kept.
+    `criterion` is "area_error" (smallest `max_area_error`, the default), "mass_error"
+    (smallest `max_mass_error`, which is the figure that matters under a density field)
+    or "centroid" (smallest worst |site - cell reference point| relative to the diagonal,
+    the reference point being whichever one `relax_to` asks for). `margin`, the density
+    field and `relax_to` are handed to every start, so it is the kept result that carries
+    them.
     """
     if k < 1:
         raise ValueError("k must be >= 1")
-    if criterion not in ("area_error", "centroid"):
-        raise ValueError("criterion must be 'area_error' or 'centroid'")
+    if criterion not in ("area_error", "centroid", "mass_error"):
+        raise ValueError("criterion must be 'area_error', 'mass_error' or 'centroid'")
     poly, _ = _ring(polygon)
+    field = _density_field(poly, density_zones, default_density)  # raises before any start
     if seed is None:
         starts: list[int | None] = [None, *range(k)]
     else:
@@ -477,7 +842,7 @@ def best_weighted_cvt(
     for start in starts:
         result = weighted_cvt(
             polygon,
-            area_weights,
+            cell_weights,
             seed=start,
             area_tol=area_tol,
             max_iter=max_iter,
@@ -485,12 +850,19 @@ def best_weighted_cvt(
             damping=damping,
             neighbour_mode=neighbour_mode,
             margin=margin,
+            density_zones=density_zones,
+            default_density=default_density,
+            relax_to=relax_to,
+            mass_tol=mass_tol,
         )
-        score = (
-            result.max_area_error
-            if criterion == "area_error"
-            else _centroid_error(poly, np.asarray(result.sites), np.asarray(result.weights))
-        )
+        if criterion == "area_error":
+            score = result.max_area_error
+        elif criterion == "mass_error":
+            score = result.max_mass_error
+        else:
+            score = _centroid_error(
+                poly, np.asarray(result.sites), np.asarray(result.weights), field, relax_to
+            )
         if score < best_score:
             best, best_score = result, score
     assert best is not None  # starts is never empty, so the loop always assigns
@@ -522,42 +894,82 @@ def cell_areas(
     return [_area(cell) for cell in power_cells(polygon, sites, weights)]
 
 
+def cell_masses(
+    polygon: Points,
+    sites: Points,
+    weights: Values | None = None,
+    *,
+    density_zones: Sequence[tuple[Points, float]] | None = None,
+    default_density: float = 1.0,
+) -> list[float]:
+    """Mass of each power cell under the density field, in the order the sites were given.
+
+    With no density field this is :func:`cell_areas`: a unit default density over the
+    whole polygon leaves each mass equal to the cell's area.
+    """
+    poly, _ = _ring(polygon)
+    pts = np.asarray(sites, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) == 0:
+        raise ValueError("sites must be an (n, 2) array of coords")
+    lam = np.zeros(len(pts)) if weights is None else np.asarray(weights, dtype=float)
+    if lam.shape != (len(pts),):
+        raise ValueError("weights must have one entry per site")
+    field = _density_field(poly, density_zones, default_density)
+    return [_cell_mass(cell, field) for cell in _power_cells(poly, pts, lam, "auto")]
+
+
 def validate_weighted(
     polygon: Points,
     sites: Points,
     weights: Values,
-    area_weights: Values,
+    cell_weights: Values,
     tol: float = 1e-3,
     area_tol: float = 1e-2,
     margin: float = 0.0,
+    density_zones: Sequence[tuple[Points, float]] | None = None,
+    default_density: float = 1.0,
+    relax_to: str = "area",
+    mass_tol: float = 1e-2,
 ) -> list[str]:
     """List what is wrong with a weighted tessellation; an empty list means it is fine.
 
     Checks the site count, that the sites are distinct and inside the polygon, that no
     cell collapsed, that the cells tile the polygon, that each site sits within `tol`
-    (times the diagonal) of its own cell's centroid, and that the areas are within
-    `area_tol` of the ratio `area_weights` asks for. `weights` are the Laguerre
+    (times the diagonal) of its own cell's reference point, and that the areas are within
+    `area_tol` of the ratio `cell_weights` asks for. `weights` are the Laguerre
     potentials, as returned in :attr:`WeightedCVT.weights`.
 
     A positive `margin` also requires every site to be at least that far from each edge
     line. A run made with a margin reports sites held at it as not centroidal, which is
     expected: give `tol` room for that, or check the margin on its own.
+
+    With a density field the mass ratio is checked against `mass_tol` instead of the area
+    ratio, any cell left holding no mass is reported, and the reference point is the
+    cell's centre of mass when `relax_to` is "mass" (its area centroid otherwise). A bad
+    density field comes back as a single message of its own, since nothing else can be
+    measured without it.
     """
     poly, poly_area2 = _ring(polygon)
     total = poly_area2 / 2.0
     diag = float(np.hypot(*np.ptp(poly, axis=0)))
+    if relax_to not in ("area", "mass"):
+        return [f"relax_to must be 'area' or 'mass', got {relax_to!r}"]
+    try:
+        field = _density_field(poly, density_zones, default_density)
+    except ValueError as exc:
+        return [f"mass density field: {exc}"]
     pts = np.asarray(sites, dtype=float)
     if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) == 0:
         return [f"sites must be an (n, 2) array of coords, got shape {pts.shape}"]
     n = len(pts)
     lam = np.asarray(weights, dtype=float)
-    ratios = np.asarray(area_weights, dtype=float)
+    ratios = np.asarray(cell_weights, dtype=float)
     if lam.shape != (n,) or ratios.shape != (n,):
-        return [f"weights and area_weights must each have {n} entries"]
+        return [f"weights and cell_weights must each have {n} entries"]
 
     bad: list[str] = []
     if not np.isfinite(ratios).all() or (ratios <= 0.0).any():
-        bad.append("area_weights must all be positive and finite")
+        bad.append("cell_weights must all be positive and finite")
     if not _inside(poly, pts).all():
         bad.append("site(s) outside the polygon")
     if margin > 0.0:
@@ -583,14 +995,40 @@ def validate_weighted(
         bad.append(f"collapsed cell(s) at site(s) {dead}")
     if abs(areas.sum() - total) > 1e-9 * total:
         bad.append(f"cells do not tile the polygon: sum/area = {areas.sum() / total:.12f}")
-    residual = max(
-        (float(np.linalg.norm(_centroid(cells[i], pts[i]) - pts[i])) for i in alive),
-        default=0.0,
-    )
+
+    by_mass = field is not None and relax_to == "mass"
+    residual = 0.0
+    for i in alive:
+        ref = _centroid(cells[i], pts[i])
+        if field is not None and relax_to == "mass":
+            mass, moment = _cell_mass_moment(cells[i], field)
+            if mass <= 0.0:
+                continue
+            ref = moment / mass
+            if not _inside(poly, ref.reshape(1, 2))[0]:
+                continue  # no site can sit on a centre of mass that left the polygon
+        residual = max(residual, float(np.linalg.norm(ref - pts[i])))
     if residual > tol * diag:
-        bad.append(f"not centroidal: worst |site - cell centroid| = {residual:.6g}, limit {tol * diag:.6g}")
-    targets = total * ratios / ratios.sum()
-    error = float(np.abs(areas - targets).max() / total)
-    if error > area_tol:
-        bad.append(f"areas off target: worst |A - target|/total = {error:.6g}, limit {area_tol:.6g}")
+        what = "|site - cell centre of mass|" if by_mass else "|site - cell centroid|"
+        bad.append(
+            f"not centroidal: worst {what} = {residual:.6g}, limit {tol * diag:.6g}"
+        )
+
+    if field is None:
+        targets = total * ratios / ratios.sum()
+        error = float(np.abs(areas - targets).max() / total)
+        if error > area_tol:
+            bad.append(f"areas off target: worst |A - target|/total = {error:.6g}, limit {area_tol:.6g}")
+        return bad
+
+    masses = np.array([_cell_mass(cell, field) for cell in cells])
+    starved = np.flatnonzero((masses <= 0.0) & (areas > 1e-12 * total)).tolist()
+    if starved:
+        bad.append(f"cell(s) holding no mass at site(s) {starved}")
+    mass_targets = field.total * ratios / ratios.sum()
+    error = float(np.abs(masses - mass_targets).max() / field.total)
+    if error > mass_tol:
+        bad.append(
+            f"masses off target: worst |M - target|/total = {error:.6g}, limit {mass_tol:.6g}"
+        )
     return bad

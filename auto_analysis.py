@@ -205,14 +205,19 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
                      best_of: int = 0,
                      area_tol: float = 1e-3,
                      margin: float = 0.0,
+                     density_zones: Sequence[tuple[Sequence[Sequence[float]], float]] | None = None,
+                     default_density: float = 1.0,
+                     relax_to: str = "area",
+                     mass_tol: float = 1e-3,
                      allow_nonconverged: bool = False,
                      apply: bool = True) -> list[list[float]]:
     """Generate a pile layout on `polygon` and write it to the workbook.
 
     `weighted_cvt` builds the layout: `polygon` is the convex cap outline, and
-    `weights` holds one area weight per pile, so a larger weight gives a larger
-    cell and a lighter pile. `weights=None` gives every pile the same area; the
-    pile count is then `n_piles`, or the prefixes already in 'Pile Coords' when
+    `weights` holds one target share per pile, so a larger weight gives a larger
+    cell and a lighter pile. The share is of the cap's area, or of its total mass
+    once a density field is given. `weights=None` gives every pile the same share;
+    the pile count is then `n_piles`, or the prefixes already in 'Pile Coords' when
     `n_piles` is None. Sites arrive ordered by descending y and then ascending x,
     and the function writes them top to bottom onto the existing rows, so the
     count has to match the prefix column. The prefixes themselves are not touched.
@@ -229,6 +234,19 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
     pushes them into SAFE through `SAFE_Use.ApplyPileCoordinates1`. With
     `apply=False` it writes the sheet only and leaves `_n_coords` alone, so
     `get_utilization()` stays tied to the last `write_coords()` call.
+
+    `density_zones`, `default_density` and `relax_to` give the cap a mass density
+    field as well. `density_zones` is a sequence of `(polygon, density)` pairs in the
+    cap's own coordinates, `default_density` covers everything they leave out, and
+    overlapping zones add up. With any zone given, or a `default_density` other
+    than 1.0, the run matches mass shares instead of area shares, so a heavier
+    region needs less area for the same pile; a density may be negative, which
+    makes a zone subtract from the background. `relax_to` is "area" (the default,
+    each pile on its cell's area centroid) or "mass" (each pile on its cell's
+    centre of mass). A mass run is judged against `mass_tol` rather than
+    `area_tol`, and what makes one fail is a target a field cannot meet, such as
+    mass asked for in a region holding none. A malformed zone polygon or a field
+    with no mass at all raises ValueError before anything is written.
 
     Returns the coordinates written, in `write_coords()`'s own shape.
     """
@@ -264,12 +282,30 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
     if best_of > 0:
         result = wcvt.best_weighted_cvt(polygon, area_weights, k=best_of,
                                         seed=seed, area_tol=area_tol,
-                                        margin=margin)
+                                        margin=margin,
+                                        density_zones=density_zones,
+                                        default_density=default_density,
+                                        relax_to=relax_to,
+                                        mass_tol=mass_tol)
     else:
         result = wcvt.weighted_cvt(polygon, area_weights, seed=seed,
-                                   area_tol=area_tol, margin=margin)
+                                   area_tol=area_tol, margin=margin,
+                                   density_zones=density_zones,
+                                   default_density=default_density,
+                                   relax_to=relax_to,
+                                   mass_tol=mass_tol)
 
     if not result.converged and not allow_nonconverged:
+        if density_zones:
+            raise RuntimeError(
+                f"the layout did not reach the requested mass shares: the worst cell "
+                f"misses its target by {result.max_mass_error:.3g} of the cap's total "
+                f"mass after {result.iterations} iteration(s) (mass_tol={mass_tol:g}). "
+                "Nothing was written. Loosen mass_tol, lower margin, raise best_of, or "
+                "pass allow_nonconverged=True. A density field can be what puts a "
+                "target out of reach: check the rings, their densities and "
+                "default_density"
+            )
         raise RuntimeError(
             f"the layout did not reach the requested areas: the worst cell misses its "
             f"target by {result.max_area_error:.3g} of the cap area after "
@@ -278,11 +314,18 @@ def init_pile_layout(polygon: Sequence[Sequence[float]],
             "allow_nonconverged=True."
         )
 
+    mass_note = ""
+    if density_zones:
+        mass_note = (
+            f"; worst mass error {result.max_mass_error:.3g} of the cap's total mass, "
+            f"cells {min(result.masses):.6g}..{max(result.masses):.6g} vs targets "
+            f"{min(result.mass_targets):.6g}..{max(result.mass_targets):.6g}"
+        )
     print(f"{_stamp()}  init_pile_layout: {len(result.sites)} pile(s), "
           f"{result.iterations} iteration(s), converged={result.converged}, worst "
           f"area error {result.max_area_error:.3g} of the cap area; cells "
           f"{min(result.areas):.6g}..{max(result.areas):.6g} vs targets "
-          f"{min(result.targets):.6g}..{max(result.targets):.6g}", flush=True)
+          f"{min(result.targets):.6g}..{max(result.targets):.6g}{mass_note}", flush=True)
 
     coords = [[float(x), float(y)] for x, y in result.sites]
     if apply:
