@@ -50,7 +50,7 @@ from record_store import (RecordStore, record_coords, record_max_util,
 # model glue: the only part that knows about the Auto Piling model.
 # ---------------------------------------------------------------------------
 # RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records.csv"
-RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records_2026-10-11_02.csv"
+RECORDS_CSV: Path = Path(__file__).resolve().parent / "data" / "SWTKT_test_records_2026-10-12.csv"
                                 # the run-records log: read back and appended to
 
 STEP_SIZE = 500.0                               # trial move distance, model units
@@ -212,8 +212,8 @@ def main() -> None:
     MARGIN = 3500
 
     # ---- write that layout into the sheet and into SAFE -------------------
-    init_coords: list[list[float]]  = aa.init_pile_layout(CAP_POLYGON, PILE_WEIGHTS, n_piles=N_PILES, seed=42, best_of=7, margin=MARGIN)
-    print(init_coords)
+    init_coords: list[list[float]]  = aa.init_pile_layout(CAP_POLYGON, PILE_WEIGHTS, n_piles=N_PILES, seed=42, margin=MARGIN)
+    # print(init_coords)
     store = RecordStore.load(RECORDS_CSV)
 
     try:
